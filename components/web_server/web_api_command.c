@@ -75,11 +75,12 @@ static esp_err_t command_post_handler(httpd_req_t *req)
     const char *cmd_str = j_cmd->valuestring;
     sm_command_t cmd;
 
-    if (strcmp(cmd_str, "start_auto") == 0)      cmd = CMD_START_AUTO;
-    else if (strcmp(cmd_str, "stop") == 0)        cmd = CMD_STOP;
+    if (strcmp(cmd_str, "start_auto") == 0)        cmd = CMD_START_AUTO;
+    else if (strcmp(cmd_str, "stop") == 0)          cmd = CMD_STOP;
     else if (strcmp(cmd_str, "start_washing") == 0) cmd = CMD_START_WASHING;
-    else if (strcmp(cmd_str, "set_manual") == 0)  cmd = CMD_SET_MANUAL;
-    else if (strcmp(cmd_str, "reset_fault") == 0) cmd = CMD_RESET_FAULT;
+    else if (strcmp(cmd_str, "confirm_wash") == 0)  cmd = CMD_CONFIRM_WASH_PHASE;
+    else if (strcmp(cmd_str, "set_manual") == 0)    cmd = CMD_SET_MANUAL;
+    else if (strcmp(cmd_str, "reset_fault") == 0)   cmd = CMD_RESET_FAULT;
     else {
         cJSON_Delete(root);
         return send_error(req, 400, "unknown command");
@@ -200,6 +201,14 @@ static esp_err_t config_washing_post_handler(httpd_req_t *req)
         cfg.max_temp_C = (float)j->valuedouble;
     if ((j = cJSON_GetObjectItem(root, "t_overshoot_C")) && cJSON_IsNumber(j))
         cfg.t_overshoot_C = (float)j->valuedouble;
+    if ((j = cJSON_GetObjectItem(root, "hysteresis_C")) && cJSON_IsNumber(j))
+        cfg.hysteresis_C = (float)j->valuedouble;
+    if ((j = cJSON_GetObjectItem(root, "heat_timeout_min")) && cJSON_IsNumber(j))
+        cfg.heat_timeout_min = j->valueint;
+    if ((j = cJSON_GetObjectItem(root, "supply_time_min")) && cJSON_IsNumber(j))
+        cfg.supply_time_min = j->valueint;
+    if ((j = cJSON_GetObjectItem(root, "drain_time_min")) && cJSON_IsNumber(j))
+        cfg.drain_time_min = j->valueint;
 
     config_manager_set_washing(&cfg);
 

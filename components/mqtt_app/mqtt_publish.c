@@ -25,30 +25,6 @@ static const char *TAG = "mqtt_pub";
 
 /* --- Вспомогательные --- */
 
-static const char *state_to_str(sm_state_t st)
-{
-    static const char *names[] = {"IDLE", "AUTO", "WASHING", "MANUAL", "FAULT"};
-    return (st < sizeof(names) / sizeof(names[0])) ? names[st] : "UNKNOWN";
-}
-
-static const char *auto_sub_str(auto_substate_t sub)
-{
-    static const char *names[] = {
-        "STARTING_PUMP1", "RAMP", "STARTING_PUMP2", "FILLING_INTERM",
-        "STARTING_PUMP3", "RUNNING", "STOPPING"
-    };
-    return (sub < sizeof(names) / sizeof(names[0])) ? names[sub] : "UNKNOWN";
-}
-
-static const char *wash_sub_str(wash_substate_t sub)
-{
-    static const char *names[] = {
-        "WAIT_HEAT", "HEATING", "WAIT_SUPPLY", "SUPPLY",
-        "WAIT_DRAIN", "DRAIN", "DONE"
-    };
-    return (sub < sizeof(names) / sizeof(names[0])) ? names[sub] : "UNKNOWN";
-}
-
 static const char *doser_state_str(doser_state_t st)
 {
     static const char *names[] = {"OFF", "RUNNING", "PAUSE"};
@@ -73,12 +49,12 @@ void mqtt_publish_full_status(esp_mqtt_client_handle_t client)
     sm_status_t st = state_machine_get_status();
     snprintf(buf, sizeof(buf),
              "{\"state\":\"%s\",\"auto_sub\":%s%s%s,\"wash_sub\":%s%s%s,\"fault_flags\":%lu}",
-             state_to_str(st.state),
+             sm_state_name(st.state),
              st.state == SM_AUTO ? "\"" : "",
-             st.state == SM_AUTO ? auto_sub_str(st.auto_sub) : "null",
+             st.state == SM_AUTO ? sm_auto_sub_name(st.auto_sub) : "null",
              st.state == SM_AUTO ? "\"" : "",
              st.state == SM_WASHING ? "\"" : "",
-             st.state == SM_WASHING ? wash_sub_str(st.wash_sub) : "null",
+             st.state == SM_WASHING ? sm_wash_sub_name(st.wash_sub) : "null",
              st.state == SM_WASHING ? "\"" : "",
              (unsigned long)st.fault_flags);
     esp_mqtt_client_publish(client, "ro_plant/status/state", buf, 0, 1, 1);
@@ -195,8 +171,9 @@ void mqtt_publish_diagnostics(esp_mqtt_client_handle_t client)
     diagnostics_data_t diag;
     diagnostics_collect(&diag);
 
-    char buf[384];
+    char buf[512];
     int pos = 0;
+    const int cap = (int)sizeof(buf) - 1;  /* резерв для '\0' */
 
     /* Система */
     pos += snprintf(buf + pos, sizeof(buf) - pos,
@@ -206,30 +183,33 @@ void mqtt_publish_diagnostics(esp_mqtt_client_handle_t client)
                     (long long)(diag.uptime_us / 1000000LL));
 
     /* Стеки задач */
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "\"stack\":{");
-    for (int i = 0; i < diag.task_count; i++) {
+    if (pos < cap) pos += snprintf(buf + pos, sizeof(buf) - pos, "\"stack\":{");
+    for (int i = 0; i < diag.task_count && pos < cap; i++) {
         pos += snprintf(buf + pos, sizeof(buf) - pos, "%s\"%s\":%lu",
                         i ? "," : "",
                         diag.tasks[i].name,
                         (unsigned long)diag.tasks[i].stack_free);
     }
-    pos += snprintf(buf + pos, sizeof(buf) - pos, "},");
+    if (pos < cap) pos += snprintf(buf + pos, sizeof(buf) - pos, "},");
 
     /* Modbus */
-    pos += snprintf(buf + pos, sizeof(buf) - pos,
-                    "\"modbus\":{\"errors\":[%lu,%lu,%lu,%lu],"
-                    "\"online\":[%s,%s,%s,%s]},",
-                    (unsigned long)diag.mb_errors[0],
-                    (unsigned long)diag.mb_errors[1],
-                    (unsigned long)diag.mb_errors[2],
-                    (unsigned long)diag.mb_errors[3],
-                    diag.mb_online[0] ? "true" : "false",
-                    diag.mb_online[1] ? "true" : "false",
-                    diag.mb_online[2] ? "true" : "false",
-                    diag.mb_online[3] ? "true" : "false");
+    if (pos < cap) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "\"modbus\":{\"errors\":[%lu,%lu,%lu,%lu],"
+                        "\"online\":[%s,%s,%s,%s]},",
+                        (unsigned long)diag.mb_errors[0],
+                        (unsigned long)diag.mb_errors[1],
+                        (unsigned long)diag.mb_errors[2],
+                        (unsigned long)diag.mb_errors[3],
+                        diag.mb_online[0] ? "true" : "false",
+                        diag.mb_online[1] ? "true" : "false",
+                        diag.mb_online[2] ? "true" : "false",
+                        diag.mb_online[3] ? "true" : "false");
+    }
 
-    /* Watchdog stale (убираем последнюю запятую в закрытии) */
-    snprintf(buf + pos, sizeof(buf) - pos, "\"wdt_stale\":0}");
+    if (pos < cap) {
+        snprintf(buf + pos, sizeof(buf) - pos, "\"wdt_stale\":0}");
+    }
 
     esp_mqtt_client_publish(client, "ro_plant/status/diagnostics", buf, 0, 0, 0);
 }

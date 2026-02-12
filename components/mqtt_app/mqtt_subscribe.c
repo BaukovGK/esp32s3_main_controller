@@ -9,7 +9,7 @@
 #include "state_machine.h"
 #include "doser.h"
 #include "config_manager.h"
-#include "hal_gpio.h"
+#include "board_config.h"
 
 #include <string.h>
 
@@ -93,13 +93,14 @@ static void handle_heater(const char *data, int len)
 
     cJSON *j_on = cJSON_GetObjectItem(root, "on");
     if (j_on && cJSON_IsBool(j_on)) {
-        uint8_t cur = hal_gpio_read_do_state();
+        /* Читаем желаемую маску SM (не аппаратное состояние) и переключаем бит ТЭНа */
+        uint8_t mask = state_machine_get_manual_do_mask();
         if (cJSON_IsTrue(j_on)) {
-            cur |= (1 << 3);   /* DO4 = ТЭН (бит 3) */
+            mask |= (1 << (BOARD_DO_HEATER - 1));
         } else {
-            cur &= ~(1 << 3);
+            mask &= ~(1 << (BOARD_DO_HEATER - 1));
         }
-        state_machine_manual_set_do(cur);
+        state_machine_manual_set_do(mask);
         ESP_LOGI(TAG, "MQTT нагреватель: %s", cJSON_IsTrue(j_on) ? "ВКЛ" : "ВЫКЛ");
     }
     cJSON_Delete(root);
@@ -188,23 +189,23 @@ void mqtt_subscribe_all(esp_mqtt_client_handle_t client)
 void mqtt_subscribe_handle_message(const char *topic, int topic_len,
                                     const char *data, int data_len)
 {
-    /* ro_plant/command/mode */
-    if (topic_len >= 24 && strncmp(topic, "ro_plant/command/mode", 21) == 0) {
+    /* ro_plant/command/mode (21 символ) */
+    if (topic_len == 21 && strncmp(topic, "ro_plant/command/mode", 21) == 0) {
         handle_mode(data, data_len);
     }
-    /* ro_plant/command/pump */
-    else if (topic_len >= 24 && strncmp(topic, "ro_plant/command/pump", 21) == 0) {
+    /* ro_plant/command/pump (21 символ) */
+    else if (topic_len == 21 && strncmp(topic, "ro_plant/command/pump", 21) == 0) {
         handle_pump(data, data_len);
     }
-    /* ro_plant/command/doser */
-    else if (topic_len >= 25 && strncmp(topic, "ro_plant/command/doser", 22) == 0) {
+    /* ro_plant/command/doser (22 символа) */
+    else if (topic_len == 22 && strncmp(topic, "ro_plant/command/doser", 22) == 0) {
         handle_doser(data, data_len);
     }
-    /* ro_plant/command/heater */
-    else if (topic_len >= 26 && strncmp(topic, "ro_plant/command/heater", 23) == 0) {
+    /* ro_plant/command/heater (23 символа) */
+    else if (topic_len == 23 && strncmp(topic, "ro_plant/command/heater", 23) == 0) {
         handle_heater(data, data_len);
     }
-    /* ro_plant/settings/<section> */
+    /* ro_plant/settings/<section> (18+ символов) */
     else if (topic_len > 18 && strncmp(topic, "ro_plant/settings/", 18) == 0) {
         handle_settings(topic + 18, topic_len - 18, data, data_len);
     }

@@ -8,6 +8,7 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "config_manager.h"
 #include "alarm_manager.h"
@@ -32,21 +33,17 @@ static esp_mqtt_client_handle_t s_client = NULL;
 static TaskHandle_t s_task_handle = NULL;
 static volatile bool s_connected = false;
 
-/* Очередь аварий для отложенной публикации */
+/* Потокобезопасная очередь аварий (FreeRTOS queue) */
 #define ALARM_QUEUE_SIZE 16
-static alarm_entry_t s_alarm_queue[ALARM_QUEUE_SIZE];
-static volatile int s_alarm_queue_head = 0;
-static volatile int s_alarm_queue_tail = 0;
+static QueueHandle_t s_alarm_queue = NULL;
 
 /* --- Callback аварий для alarm_manager --- */
 
 static void alarm_notify_cb(const alarm_entry_t *entry)
 {
-    /* Помещаем в кольцевой буфер, будим задачу */
-    int next = (s_alarm_queue_head + 1) % ALARM_QUEUE_SIZE;
-    if (next != s_alarm_queue_tail) {
-        s_alarm_queue[s_alarm_queue_head] = *entry;
-        s_alarm_queue_head = next;
+    if (s_alarm_queue) {
+        /* xQueueSendFromISR не нужен — callback вызывается из обычной задачи */
+        xQueueSend(s_alarm_queue, entry, 0);
     }
     if (s_task_handle) {
         xTaskNotifyGive(s_task_handle);
@@ -126,9 +123,9 @@ static void mqtt_task(void *arg)
         }
 
         /* Публикуем аварии из очереди */
-        while (s_alarm_queue_tail != s_alarm_queue_head) {
-            mqtt_publish_alarm(s_client, &s_alarm_queue[s_alarm_queue_tail]);
-            s_alarm_queue_tail = (s_alarm_queue_tail + 1) % ALARM_QUEUE_SIZE;
+        alarm_entry_t alarm;
+        while (xQueueReceive(s_alarm_queue, &alarm, 0) == pdTRUE) {
+            mqtt_publish_alarm(s_client, &alarm);
         }
 
         /* Периодическая публикация полного статуса */
@@ -149,6 +146,15 @@ esp_err_t mqtt_app_start(void)
     if (s_client) {
         ESP_LOGW(TAG, "MQTT уже запущен");
         return ESP_OK;
+    }
+
+    /* Создать очередь аварий (если ещё не создана) */
+    if (!s_alarm_queue) {
+        s_alarm_queue = xQueueCreate(ALARM_QUEUE_SIZE, sizeof(alarm_entry_t));
+        if (!s_alarm_queue) {
+            ESP_LOGE(TAG, "Не удалось создать очередь аварий");
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     const config_mqtt_t *cfg = &config_manager_get()->mqtt;

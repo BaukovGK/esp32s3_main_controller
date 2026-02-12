@@ -83,8 +83,20 @@ void state_machine_send_command(sm_command_t cmd);
  */
 void state_machine_manual_set_do(uint8_t mask);
 
+/**
+ * @brief Получить текущую желаемую маску DO в режиме MANUAL
+ */
+uint8_t state_machine_get_manual_do_mask(void);
+
 sm_status_t state_machine_get_status(void);
 sm_state_t  state_machine_get_state(void);
+
+/**
+ * @brief Конвертация состояний в строковые имена (общие утилиты)
+ */
+const char *sm_state_name(sm_state_t st);
+const char *sm_auto_sub_name(auto_substate_t sub);
+const char *sm_wash_sub_name(wash_substate_t sub);
 
 #ifdef __cplusplus
 }

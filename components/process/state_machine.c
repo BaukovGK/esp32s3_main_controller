@@ -62,16 +62,36 @@ static void enter_fault(uint32_t flags)
     }
 }
 
-static const char *state_name(sm_state_t st)
+/* ===== Общие утилиты конвертации имён (экспортируемые) ===== */
+
+const char *sm_state_name(sm_state_t st)
 {
     static const char *names[] = {"IDLE", "AUTO", "WASHING", "MANUAL", "FAULT"};
-    return (st < sizeof(names)/sizeof(names[0])) ? names[st] : "?";
+    return (st < sizeof(names)/sizeof(names[0])) ? names[st] : "UNKNOWN";
+}
+
+const char *sm_auto_sub_name(auto_substate_t sub)
+{
+    static const char *names[] = {
+        "STARTING_PUMP1", "RAMP", "STARTING_PUMP2", "FILLING_INTERM",
+        "STARTING_PUMP3", "RUNNING", "STOPPING"
+    };
+    return (sub < sizeof(names)/sizeof(names[0])) ? names[sub] : "UNKNOWN";
+}
+
+const char *sm_wash_sub_name(wash_substate_t sub)
+{
+    static const char *names[] = {
+        "WAIT_HEAT", "HEATING", "WAIT_SUPPLY", "SUPPLY",
+        "WAIT_DRAIN", "DRAIN", "DONE"
+    };
+    return (sub < sizeof(names)/sizeof(names[0])) ? names[sub] : "UNKNOWN";
 }
 
 static void set_state(sm_state_t new_state)
 {
     if (s_state != new_state) {
-        ESP_LOGI(TAG, "Состояние: %s → %s", state_name(s_state), state_name(new_state));
+        ESP_LOGI(TAG, "Состояние: %s → %s", sm_state_name(s_state), sm_state_name(new_state));
         s_state = new_state;
         s_step_start_time = esp_timer_get_time();
     }
@@ -157,12 +177,18 @@ static void update_auto(const interlock_result_t *ilk)
         }
         break;
 
-    case AUTO_FILLING_INTERM:
+    case AUTO_FILLING_INTERM: {
         s_want_pump_feed = true;
         s_want_pump_stage1 = true;
-        /* Переход к запуску 3-го насоса */
-        set_auto_sub(AUTO_STARTING_PUMP3);
+        /* Ждём появления уровня в промбаке перед запуском 3-го насоса.
+         * DI2 (NC): бит=1 → датчик замкнут → вода есть; бит=0 → пуст */
+        bool interm_not_empty = (di & (1 << (BOARD_DI_INTERM_EMPTY - 1))) != 0;
+        if (interm_not_empty) {
+            ESP_LOGI(TAG, "Промбак заполнен — запуск насоса 3");
+            set_auto_sub(AUTO_STARTING_PUMP3);
+        }
         break;
+    }
 
     case AUTO_STARTING_PUMP3:
         s_want_pump_feed = true;
@@ -369,6 +395,14 @@ void state_machine_manual_set_do(uint8_t mask)
         s_manual_do_mask = mask;
     }
     portEXIT_CRITICAL(&s_mux);
+}
+
+uint8_t state_machine_get_manual_do_mask(void)
+{
+    portENTER_CRITICAL(&s_mux);
+    uint8_t mask = s_manual_do_mask;
+    portEXIT_CRITICAL(&s_mux);
+    return mask;
 }
 
 sm_status_t state_machine_get_status(void)

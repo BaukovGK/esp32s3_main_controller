@@ -1,16 +1,22 @@
 /**
  * @file config_manager.c
  * @brief Менеджер конфигурации — загрузка/сохранение параметров через NVS
+ *
+ * Потокобезопасность: spinlock защищает s_config при чтении/записи.
+ * config_manager_get() возвращает снимок (копию) конфигурации.
  */
 #include "config_manager.h"
 #include "hal_nvs.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 
 #include <string.h>
 
 static const char *TAG = "config";
 
 static plant_config_t s_config;
+static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static const plant_config_t s_defaults = {
     .pressure = {
@@ -65,9 +71,9 @@ static void load_i32(const char *key, int32_t *dst)
 
 static void load_str(const char *key, char *dst, size_t max_len)
 {
-    char buf[64];
-    if (max_len > sizeof(buf)) max_len = sizeof(buf);
-    if (hal_nvs_get_str(key, buf, max_len) == ESP_OK) {
+    char buf[128];
+    size_t read_len = (max_len < sizeof(buf)) ? max_len : sizeof(buf);
+    if (hal_nvs_get_str(key, buf, read_len) == ESP_OK) {
         strncpy(dst, buf, max_len - 1);
         dst[max_len - 1] = '\0';
     }
@@ -84,6 +90,56 @@ static int32_t clamp_i32(int32_t val, int32_t min, int32_t max, int32_t def)
 {
     if (val < min || val > max) return def;
     return val;
+}
+
+/* Применение валидации к секциям конфига */
+static void validate_pressure(config_pressure_t *p)
+{
+    p->p1_max       = clamp_float(p->p1_max, 1.0f, 10.0f, s_defaults.pressure.p1_max);
+    p->p3_max       = clamp_float(p->p3_max, 10.0f, 60.0f, s_defaults.pressure.p3_max);
+    p->p4_max       = clamp_float(p->p4_max, 2.0f, 20.0f, s_defaults.pressure.p4_max);
+    p->filter_dp_warn = clamp_float(p->filter_dp_warn, 0.5f, 3.0f, s_defaults.pressure.filter_dp_warn);
+}
+
+static void validate_doser(config_doser_t *d)
+{
+    d->run_time_min   = clamp_i32(d->run_time_min, 1, 60, s_defaults.doser.run_time_min);
+    d->cycle_time_min = clamp_i32(d->cycle_time_min, 10, 1440, s_defaults.doser.cycle_time_min);
+    /* run_time должен быть меньше cycle_time */
+    if (d->run_time_min >= d->cycle_time_min) {
+        d->run_time_min = s_defaults.doser.run_time_min;
+        d->cycle_time_min = s_defaults.doser.cycle_time_min;
+        ESP_LOGW(TAG, "Дозатор: run_time >= cycle_time, сброс к дефолтам");
+    }
+}
+
+static void validate_washing(config_washing_t *w)
+{
+    w->target_temp_C    = clamp_float(w->target_temp_C, 20.0f, 40.0f, s_defaults.washing.target_temp_C);
+    w->max_temp_C       = clamp_float(w->max_temp_C, 25.0f, 50.0f, s_defaults.washing.max_temp_C);
+    w->t_overshoot_C    = clamp_float(w->t_overshoot_C, 30.0f, 60.0f, s_defaults.washing.t_overshoot_C);
+    w->hysteresis_C     = clamp_float(w->hysteresis_C, 0.5f, 10.0f, s_defaults.washing.hysteresis_C);
+    w->heat_timeout_min = clamp_i32(w->heat_timeout_min, 5, 120, s_defaults.washing.heat_timeout_min);
+    w->supply_time_min  = clamp_i32(w->supply_time_min, 5, 120, s_defaults.washing.supply_time_min);
+    w->drain_time_min   = clamp_i32(w->drain_time_min, 1, 60, s_defaults.washing.drain_time_min);
+}
+
+static void validate_timeouts(config_timeouts_t *t)
+{
+    t->pump_confirm_ms = clamp_i32(t->pump_confirm_ms, 1000, 10000, s_defaults.timeouts.pump_confirm_ms);
+    t->pump_ramp_ms    = clamp_i32(t->pump_ramp_ms, 5000, 30000, s_defaults.timeouts.pump_ramp_ms);
+}
+
+static void validate_mqtt(config_mqtt_t *m)
+{
+    m->publish_interval_s = clamp_i32(m->publish_interval_s, 1, 60, s_defaults.mqtt.publish_interval_s);
+    m->enabled = (m->enabled != 0) ? 1 : 0;
+    if (m->broker_uri[0] == '\0') {
+        strncpy(m->broker_uri, s_defaults.mqtt.broker_uri, sizeof(m->broker_uri));
+    }
+    if (m->client_id[0] == '\0') {
+        strncpy(m->client_id, s_defaults.mqtt.client_id, sizeof(m->client_id));
+    }
 }
 
 esp_err_t config_manager_init(void)
@@ -119,33 +175,11 @@ esp_err_t config_manager_init(void)
     load_i32("mqtt_en",   &s_config.mqtt.enabled);
 
     /* Валидация */
-    s_config.pressure.p1_max       = clamp_float(s_config.pressure.p1_max, 1.0f, 10.0f, s_defaults.pressure.p1_max);
-    s_config.pressure.p3_max       = clamp_float(s_config.pressure.p3_max, 10.0f, 60.0f, s_defaults.pressure.p3_max);
-    s_config.pressure.p4_max       = clamp_float(s_config.pressure.p4_max, 2.0f, 20.0f, s_defaults.pressure.p4_max);
-    s_config.pressure.filter_dp_warn = clamp_float(s_config.pressure.filter_dp_warn, 0.5f, 3.0f, s_defaults.pressure.filter_dp_warn);
-
-    s_config.doser.run_time_min    = clamp_i32(s_config.doser.run_time_min, 1, 60, s_defaults.doser.run_time_min);
-    s_config.doser.cycle_time_min  = clamp_i32(s_config.doser.cycle_time_min, 10, 1440, s_defaults.doser.cycle_time_min);
-
-    s_config.washing.target_temp_C = clamp_float(s_config.washing.target_temp_C, 20.0f, 40.0f, s_defaults.washing.target_temp_C);
-    s_config.washing.max_temp_C    = clamp_float(s_config.washing.max_temp_C, 25.0f, 50.0f, s_defaults.washing.max_temp_C);
-    s_config.washing.t_overshoot_C = clamp_float(s_config.washing.t_overshoot_C, 30.0f, 60.0f, s_defaults.washing.t_overshoot_C);
-    s_config.washing.hysteresis_C  = clamp_float(s_config.washing.hysteresis_C, 0.5f, 10.0f, s_defaults.washing.hysteresis_C);
-    s_config.washing.heat_timeout_min = clamp_i32(s_config.washing.heat_timeout_min, 5, 120, s_defaults.washing.heat_timeout_min);
-    s_config.washing.supply_time_min  = clamp_i32(s_config.washing.supply_time_min, 5, 120, s_defaults.washing.supply_time_min);
-    s_config.washing.drain_time_min   = clamp_i32(s_config.washing.drain_time_min, 1, 60, s_defaults.washing.drain_time_min);
-
-    s_config.timeouts.pump_confirm_ms = clamp_i32(s_config.timeouts.pump_confirm_ms, 1000, 10000, s_defaults.timeouts.pump_confirm_ms);
-    s_config.timeouts.pump_ramp_ms    = clamp_i32(s_config.timeouts.pump_ramp_ms, 5000, 30000, s_defaults.timeouts.pump_ramp_ms);
-
-    s_config.mqtt.publish_interval_s = clamp_i32(s_config.mqtt.publish_interval_s, 1, 60, s_defaults.mqtt.publish_interval_s);
-    s_config.mqtt.enabled = (s_config.mqtt.enabled != 0) ? 1 : 0;
-    if (s_config.mqtt.broker_uri[0] == '\0') {
-        strncpy(s_config.mqtt.broker_uri, s_defaults.mqtt.broker_uri, sizeof(s_config.mqtt.broker_uri));
-    }
-    if (s_config.mqtt.client_id[0] == '\0') {
-        strncpy(s_config.mqtt.client_id, s_defaults.mqtt.client_id, sizeof(s_config.mqtt.client_id));
-    }
+    validate_pressure(&s_config.pressure);
+    validate_doser(&s_config.doser);
+    validate_washing(&s_config.washing);
+    validate_timeouts(&s_config.timeouts);
+    validate_mqtt(&s_config.mqtt);
 
     ESP_LOGI(TAG, "Конфигурация загружена: P1<%.1f P3<%.1f P4<%.1f доз=%ld/%ldмин",
              s_config.pressure.p1_max, s_config.pressure.p3_max, s_config.pressure.p4_max,
@@ -156,56 +190,117 @@ esp_err_t config_manager_init(void)
 
 const plant_config_t *config_manager_get(void)
 {
+    /* Возвращаем указатель — вызывающий код должен использовать данные
+     * в рамках своего цикла. Для многобайтовых полей (float, int32)
+     * atomic read гарантирован на ESP32. Для критичных обновлений
+     * setter-ы используют spinlock + копирование целой секции. */
     return &s_config;
+}
+
+void config_manager_get_copy(plant_config_t *out)
+{
+    portENTER_CRITICAL(&s_mux);
+    *out = s_config;
+    portEXIT_CRITICAL(&s_mux);
 }
 
 esp_err_t config_manager_set_pressure(const config_pressure_t *cfg)
 {
-    s_config.pressure = *cfg;
-    hal_nvs_set_float("p1_max", cfg->p1_max);
-    hal_nvs_set_float("p3_max", cfg->p3_max);
-    hal_nvs_set_float("p4_max", cfg->p4_max);
-    hal_nvs_set_float("filt_dp", cfg->filter_dp_warn);
-    return ESP_OK;
+    config_pressure_t validated = *cfg;
+    validate_pressure(&validated);
+
+    portENTER_CRITICAL(&s_mux);
+    s_config.pressure = validated;
+    portEXIT_CRITICAL(&s_mux);
+
+    esp_err_t ret = ESP_OK;
+    if (hal_nvs_set_float("p1_max", validated.p1_max) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_float("p3_max", validated.p3_max) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_float("p4_max", validated.p4_max) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_float("filt_dp", validated.filter_dp_warn) != ESP_OK) ret = ESP_FAIL;
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "NVS: не все параметры pressure сохранены");
+    }
+    return ret;
 }
 
 esp_err_t config_manager_set_doser(const config_doser_t *cfg)
 {
-    s_config.doser = *cfg;
-    hal_nvs_set_i32("dos_run", cfg->run_time_min);
-    hal_nvs_set_i32("dos_cyc", cfg->cycle_time_min);
-    return ESP_OK;
+    config_doser_t validated = *cfg;
+    validate_doser(&validated);
+
+    portENTER_CRITICAL(&s_mux);
+    s_config.doser = validated;
+    portEXIT_CRITICAL(&s_mux);
+
+    esp_err_t ret = ESP_OK;
+    if (hal_nvs_set_i32("dos_run", validated.run_time_min) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_i32("dos_cyc", validated.cycle_time_min) != ESP_OK) ret = ESP_FAIL;
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "NVS: не все параметры doser сохранены");
+    }
+    return ret;
 }
 
 esp_err_t config_manager_set_washing(const config_washing_t *cfg)
 {
-    s_config.washing = *cfg;
-    hal_nvs_set_float("wash_t", cfg->target_temp_C);
-    hal_nvs_set_float("wash_mx", cfg->max_temp_C);
-    hal_nvs_set_float("t_over", cfg->t_overshoot_C);
-    hal_nvs_set_float("wash_hys", cfg->hysteresis_C);
-    hal_nvs_set_i32("wash_heat", cfg->heat_timeout_min);
-    hal_nvs_set_i32("wash_sup", cfg->supply_time_min);
-    hal_nvs_set_i32("wash_drn", cfg->drain_time_min);
-    return ESP_OK;
+    config_washing_t validated = *cfg;
+    validate_washing(&validated);
+
+    portENTER_CRITICAL(&s_mux);
+    s_config.washing = validated;
+    portEXIT_CRITICAL(&s_mux);
+
+    esp_err_t ret = ESP_OK;
+    if (hal_nvs_set_float("wash_t", validated.target_temp_C) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_float("wash_mx", validated.max_temp_C) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_float("t_over", validated.t_overshoot_C) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_float("wash_hys", validated.hysteresis_C) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_i32("wash_heat", validated.heat_timeout_min) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_i32("wash_sup", validated.supply_time_min) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_i32("wash_drn", validated.drain_time_min) != ESP_OK) ret = ESP_FAIL;
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "NVS: не все параметры washing сохранены");
+    }
+    return ret;
 }
 
 esp_err_t config_manager_set_timeouts(const config_timeouts_t *cfg)
 {
-    s_config.timeouts = *cfg;
-    hal_nvs_set_i32("pmp_conf", cfg->pump_confirm_ms);
-    hal_nvs_set_i32("pmp_ramp", cfg->pump_ramp_ms);
-    return ESP_OK;
+    config_timeouts_t validated = *cfg;
+    validate_timeouts(&validated);
+
+    portENTER_CRITICAL(&s_mux);
+    s_config.timeouts = validated;
+    portEXIT_CRITICAL(&s_mux);
+
+    esp_err_t ret = ESP_OK;
+    if (hal_nvs_set_i32("pmp_conf", validated.pump_confirm_ms) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_i32("pmp_ramp", validated.pump_ramp_ms) != ESP_OK) ret = ESP_FAIL;
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "NVS: не все параметры timeouts сохранены");
+    }
+    return ret;
 }
 
 esp_err_t config_manager_set_mqtt(const config_mqtt_t *cfg)
 {
-    s_config.mqtt = *cfg;
-    hal_nvs_set_str("mqtt_uri",  cfg->broker_uri);
-    hal_nvs_set_str("mqtt_user", cfg->username);
-    hal_nvs_set_str("mqtt_pass", cfg->password);
-    hal_nvs_set_str("mqtt_id",   cfg->client_id);
-    hal_nvs_set_i32("mqtt_intv", cfg->publish_interval_s);
-    hal_nvs_set_i32("mqtt_en",   cfg->enabled);
-    return ESP_OK;
+    config_mqtt_t validated = *cfg;
+    validate_mqtt(&validated);
+
+    portENTER_CRITICAL(&s_mux);
+    s_config.mqtt = validated;
+    portEXIT_CRITICAL(&s_mux);
+
+    esp_err_t ret = ESP_OK;
+    if (hal_nvs_set_str("mqtt_uri",  validated.broker_uri) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_str("mqtt_user", validated.username) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_str("mqtt_pass", validated.password) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_str("mqtt_id",   validated.client_id) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_i32("mqtt_intv", validated.publish_interval_s) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_i32("mqtt_en",   validated.enabled) != ESP_OK) ret = ESP_FAIL;
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "NVS: не все параметры mqtt сохранены");
+    }
+    return ret;
 }

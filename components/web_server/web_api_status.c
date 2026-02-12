@@ -34,31 +34,25 @@ static void add_float_or_null(cJSON *obj, const char *name, float val)
     }
 }
 
-static const char *state_to_str(sm_state_t st)
-{
-    static const char *names[] = {"IDLE", "AUTO", "WASHING", "MANUAL", "FAULT"};
-    return (st < sizeof(names)/sizeof(names[0])) ? names[st] : "UNKNOWN";
-}
-
-static const char *auto_sub_to_str(auto_substate_t sub)
-{
-    static const char *names[] = {
-        "STARTING_PUMP1", "RAMP", "STARTING_PUMP2", "FILLING_INTERM",
-        "STARTING_PUMP3", "RUNNING", "STOPPING"
-    };
-    return (sub < sizeof(names)/sizeof(names[0])) ? names[sub] : "UNKNOWN";
-}
-
-static const char *wash_sub_to_str(wash_substate_t sub)
-{
-    static const char *names[] = {"HEATING", "SUPPLY", "DRAIN", "DONE"};
-    return (sub < sizeof(names)/sizeof(names[0])) ? names[sub] : "UNKNOWN";
-}
-
 static const char *doser_state_to_str(doser_state_t st)
 {
     static const char *names[] = {"OFF", "RUNNING", "PAUSE"};
     return (st < sizeof(names)/sizeof(names[0])) ? names[st] : "UNKNOWN";
+}
+
+/* Безопасная отправка JSON: проверяет NULL от cJSON_PrintUnformatted */
+static esp_err_t send_json(httpd_req_t *req, cJSON *root)
+{
+    char *json_str = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json_str) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON format failed");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json_str, strlen(json_str));
+    free(json_str);
+    return ESP_OK;
 }
 
 /* ===== GET /api/v1/status ===== */
@@ -73,16 +67,16 @@ static esp_err_t status_get_handler(httpd_req_t *req)
 
     /* Состояние КА */
     sm_status_t st = state_machine_get_status();
-    cJSON_AddStringToObject(root, "state", state_to_str(st.state));
+    cJSON_AddStringToObject(root, "state", sm_state_name(st.state));
 
     if (st.state == SM_AUTO) {
-        cJSON_AddStringToObject(root, "auto_sub", auto_sub_to_str(st.auto_sub));
+        cJSON_AddStringToObject(root, "auto_sub", sm_auto_sub_name(st.auto_sub));
     } else {
         cJSON_AddNullToObject(root, "auto_sub");
     }
 
     if (st.state == SM_WASHING) {
-        cJSON_AddStringToObject(root, "wash_sub", wash_sub_to_str(st.wash_sub));
+        cJSON_AddStringToObject(root, "wash_sub", sm_wash_sub_name(st.wash_sub));
     } else {
         cJSON_AddNullToObject(root, "wash_sub");
     }
@@ -172,14 +166,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     /* Uptime */
     cJSON_AddNumberToObject(root, "uptime_s", (double)(esp_timer_get_time() / 1000000LL));
 
-    /* Отправка */
-    const char *json_str = cJSON_PrintUnformatted(root);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, json_str, strlen(json_str));
-
-    free((void *)json_str);
-    cJSON_Delete(root);
-    return ESP_OK;
+    return send_json(req, root);
 }
 
 /* ===== GET /api/v1/config ===== */
@@ -203,6 +190,10 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(j_wash, "target_temp_C", cfg->washing.target_temp_C);
     cJSON_AddNumberToObject(j_wash, "max_temp_C", cfg->washing.max_temp_C);
     cJSON_AddNumberToObject(j_wash, "t_overshoot_C", cfg->washing.t_overshoot_C);
+    cJSON_AddNumberToObject(j_wash, "hysteresis_C", cfg->washing.hysteresis_C);
+    cJSON_AddNumberToObject(j_wash, "heat_timeout_min", cfg->washing.heat_timeout_min);
+    cJSON_AddNumberToObject(j_wash, "supply_time_min", cfg->washing.supply_time_min);
+    cJSON_AddNumberToObject(j_wash, "drain_time_min", cfg->washing.drain_time_min);
 
     cJSON *j_tout = cJSON_AddObjectToObject(root, "timeouts");
     cJSON_AddNumberToObject(j_tout, "pump_confirm_ms", cfg->timeouts.pump_confirm_ms);
@@ -211,18 +202,12 @@ static esp_err_t config_get_handler(httpd_req_t *req)
     cJSON *j_mqtt = cJSON_AddObjectToObject(root, "mqtt");
     cJSON_AddStringToObject(j_mqtt, "broker_uri", cfg->mqtt.broker_uri);
     cJSON_AddStringToObject(j_mqtt, "username", cfg->mqtt.username);
-    cJSON_AddStringToObject(j_mqtt, "password", cfg->mqtt.password);
+    cJSON_AddStringToObject(j_mqtt, "password", cfg->mqtt.password[0] ? "***" : "");
     cJSON_AddStringToObject(j_mqtt, "client_id", cfg->mqtt.client_id);
     cJSON_AddNumberToObject(j_mqtt, "publish_interval_s", cfg->mqtt.publish_interval_s);
     cJSON_AddNumberToObject(j_mqtt, "enabled", cfg->mqtt.enabled);
 
-    const char *json_str = cJSON_PrintUnformatted(root);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, json_str, strlen(json_str));
-
-    free((void *)json_str);
-    cJSON_Delete(root);
-    return ESP_OK;
+    return send_json(req, root);
 }
 
 /* ===== GET /api/v1/mqtt/status ===== */
@@ -273,12 +258,7 @@ static esp_err_t alarms_get_handler(httpd_req_t *req)
         cJSON_AddItemToArray(j_hist, e);
     }
 
-    const char *json_str = cJSON_PrintUnformatted(root);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, json_str, strlen(json_str));
-    free((void *)json_str);
-    cJSON_Delete(root);
-    return ESP_OK;
+    return send_json(req, root);
 }
 
 /* ===== GET /api/v1/diagnostics ===== */
@@ -309,12 +289,7 @@ static esp_err_t diagnostics_get_handler(httpd_req_t *req)
         cJSON_AddItemToArray(j_onl, cJSON_CreateBool(diag.mb_online[i]));
     }
 
-    const char *json_str = cJSON_PrintUnformatted(root);
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, json_str, strlen(json_str));
-    free((void *)json_str);
-    cJSON_Delete(root);
-    return ESP_OK;
+    return send_json(req, root);
 }
 
 /* ===== Регистрация ===== */

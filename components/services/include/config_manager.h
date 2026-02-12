@@ -60,9 +60,15 @@ typedef struct {
 esp_err_t config_manager_init(void);
 
 /**
- * @brief Получить указатель на текущую конфигурацию (read-only)
+ * @brief Получить указатель на текущую конфигурацию (read-only).
+ *        Безопасно для чтения отдельных полей (float/int32 атомарны на ESP32).
  */
 const plant_config_t *config_manager_get(void);
+
+/**
+ * @brief Потокобезопасная копия всей конфигурации
+ */
+void config_manager_get_copy(plant_config_t *out);
 
 esp_err_t config_manager_set_pressure(const config_pressure_t *cfg);
 esp_err_t config_manager_set_doser(const config_doser_t *cfg);

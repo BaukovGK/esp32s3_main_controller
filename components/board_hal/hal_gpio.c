@@ -8,6 +8,8 @@
 
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 
 static const char *TAG = "hal_gpio";
 
@@ -24,13 +26,14 @@ static const int s_di_gpios[BOARD_DI_COUNT] = {
 };
 
 /* --- Debounce --- */
-#define DEBOUNCE_THRESHOLD  5  /* 5 × 10мс = 50мс */
+#define DEBOUNCE_THRESHOLD  5  /* 5 x 10мс = 50мс */
 
 static uint8_t s_debounce_cnt[BOARD_DI_COUNT];
 static uint8_t s_di_stable;  /* стабилизированное состояние DI (битовая маска) */
 
-/* --- DO кэш --- */
+/* --- DO кэш + спинлок для защиты read-modify-write --- */
 static uint8_t s_do_state;
+static portMUX_TYPE s_do_mux = portMUX_INITIALIZER_UNLOCKED;
 
 esp_err_t hal_gpio_init(void)
 {
@@ -117,18 +120,21 @@ bool hal_gpio_read_di_pin(uint8_t pin)
 
 esp_err_t hal_gpio_write_do(uint8_t mask)
 {
+    portENTER_CRITICAL(&s_do_mux);
     esp_err_t ret = hal_i2c_write_reg(BOARD_TCA9554_ADDR, TCA9554_REG_OUTPUT, mask);
     if (ret == ESP_OK) {
         s_do_state = mask;
     } else {
         /* Повтор 1 раз */
-        ESP_LOGW(TAG, "DO запись повтор...");
         ret = hal_i2c_write_reg(BOARD_TCA9554_ADDR, TCA9554_REG_OUTPUT, mask);
         if (ret == ESP_OK) {
             s_do_state = mask;
-        } else {
-            ESP_LOGE(TAG, "DO запись ошибка: %s", esp_err_to_name(ret));
         }
+    }
+    portEXIT_CRITICAL(&s_do_mux);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "DO запись ошибка: %s", esp_err_to_name(ret));
     }
     return ret;
 }
@@ -139,13 +145,28 @@ esp_err_t hal_gpio_write_do_pin(uint8_t pin, bool state)
         return ESP_ERR_INVALID_ARG;
     }
 
+    portENTER_CRITICAL(&s_do_mux);
     uint8_t new_state = s_do_state;
     if (state) {
         new_state |= (1 << (pin - 1));
     } else {
         new_state &= ~(1 << (pin - 1));
     }
-    return hal_gpio_write_do(new_state);
+    esp_err_t ret = hal_i2c_write_reg(BOARD_TCA9554_ADDR, TCA9554_REG_OUTPUT, new_state);
+    if (ret == ESP_OK) {
+        s_do_state = new_state;
+    } else {
+        ret = hal_i2c_write_reg(BOARD_TCA9554_ADDR, TCA9554_REG_OUTPUT, new_state);
+        if (ret == ESP_OK) {
+            s_do_state = new_state;
+        }
+    }
+    portEXIT_CRITICAL(&s_do_mux);
+
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "DO pin %d запись ошибка: %s", pin, esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 uint8_t hal_gpio_read_do_state(void)

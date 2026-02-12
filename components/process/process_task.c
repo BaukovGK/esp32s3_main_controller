@@ -20,12 +20,6 @@ static const char *TAG = "process";
 /* Период логирования: 5с / 100мс = 50 циклов */
 #define LOG_PERIOD_CYCLES  50
 
-static const char *sm_state_str(sm_state_t st)
-{
-    static const char *names[] = {"IDLE", "AUTO", "WASH", "MANUAL", "FAULT"};
-    return (st < sizeof(names)/sizeof(names[0])) ? names[st] : "?";
-}
-
 void process_task(void *arg)
 {
     ESP_LOGI(TAG, "ProcessTask запущена (100мс)");
@@ -55,25 +49,25 @@ void process_task(void *arg)
         if (++log_counter >= LOG_PERIOD_CYCLES) {
             log_counter = 0;
 
-            float p1 = analog_input_get_value(0);
-            float p2 = analog_input_get_value(1);
-            float p3 = analog_input_get_value(2);
-            float p4 = analog_input_get_value(3);
-            float t  = analog_input_get_value(4);
+            float p1 = analog_input_get_value(AI_CH_P1);
+            float p2 = analog_input_get_value(AI_CH_P2);
+            float p3 = analog_input_get_value(AI_CH_P3);
+            float p4 = analog_input_get_value(AI_CH_P4);
+            float t  = analog_input_get_value(AI_CH_T);
 
             ESP_LOGI(TAG, "[%s] P1=%.2f P2=%.2f P3=%.1f P4=%.2f T=%.1f°C",
-                     sm_state_str(st.state),
+                     sm_state_name(st.state),
                      isnan(p1) ? 0.0f : p1,
                      isnan(p2) ? 0.0f : p2,
                      isnan(p3) ? 0.0f : p3,
                      isnan(p4) ? 0.0f : p4,
                      isnan(t)  ? 0.0f : t);
 
-            float q1 = flowmeter_get_flow(0);
-            float q3 = flowmeter_get_flow(2);
-            float s1 = conductivity_get_value(0);
-            float s2 = conductivity_get_value(1);
-            float s3 = conductivity_get_value(2);
+            float q1 = flowmeter_get_flow(FLOW_CH_INLET);
+            float q3 = flowmeter_get_flow(FLOW_CH_PERM2);
+            float s1 = conductivity_get_value(COND_CH_FEED);
+            float s2 = conductivity_get_value(COND_CH_PERM1);
+            float s3 = conductivity_get_value(COND_CH_PERM2);
 
             ESP_LOGI(TAG, "  Q1=%.3f Q3=%.3f σ1=%.0f σ2=%.0f σ3=%.0f µS/cm",
                      isnan(q1) ? 0.0f : q1,
