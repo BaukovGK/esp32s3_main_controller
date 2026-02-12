@@ -4,6 +4,7 @@
  */
 #include "diagnostics.h"
 #include "modbus_poller.h"
+#include "board_config.h"
 
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -18,7 +19,9 @@ static struct {
 static int s_task_count = 0;
 
 /* Modbus slave-адреса для мониторинга */
-static const uint8_t s_mb_addrs[] = {1, 2, 10, 11};
+static const uint8_t s_mb_addrs[] = {
+    MB_ADDR_WAVESHARE_AI, MB_ADDR_URZH2KM, MB_ADDR_SL21_201, MB_ADDR_SL21_101
+};
 
 void diagnostics_register_task(const char *name, TaskHandle_t handle)
 {
@@ -47,7 +50,7 @@ void diagnostics_collect(diagnostics_data_t *out)
     }
 
     /* Modbus ошибки и онлайн-статус */
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < (int)(sizeof(s_mb_addrs) / sizeof(s_mb_addrs[0])); i++) {
         out->mb_errors[i] = modbus_poller_get_error_count(s_mb_addrs[i]);
         out->mb_online[i] = modbus_poller_is_device_online(s_mb_addrs[i]);
     }

@@ -22,6 +22,17 @@ static const char *TAG = "mb_poller";
 /* --- Порог для определения offline (ошибок подряд) --- */
 #define DEVICE_OFFLINE_THRESHOLD  10
 
+/* --- Периоды опроса, мс --- */
+#define MB_POLL_PERIOD_AI_MS      100
+#define MB_POLL_PERIOD_FLOW_MS    1000
+#define MB_POLL_PERIOD_VOL_MS     2000
+#define MB_POLL_PERIOD_COND_MS    3000
+
+/* --- Прочие таймауты --- */
+#define MB_RESPONSE_TIMEOUT_MS    1000
+#define MB_BUS_INIT_DELAY_MS      500
+#define MB_POLL_TASK_INTERVAL_MS  10
+
 /* --- Макрос для строковых литералов в дескрипторах --- */
 #define STR(s) ((char *)(s))
 
@@ -48,11 +59,11 @@ static uint16_t s_cond11_data[CID_COND11_REG_COUNT];
 
 /* --- Таблица опроса --- */
 static poll_entry_t s_poll_table[] = {
-    { CID_AI_CHANNELS, MB_ADDR_WAVESHARE_AI, 100,  0, CID_AI_REG_COUNT,        s_ai_data,     0 },
-    { CID_FLOW_RATES,  MB_ADDR_URZH2KM,      1000, 0, CID_FLOW_RATE_REG_COUNT, s_flow_data,   0 },
-    { CID_FLOW_VOLUMES,MB_ADDR_URZH2KM,      2000, 0, CID_FLOW_VOL_REG_COUNT,  s_volume_data, 0 },
-    { CID_COND_ADDR10, MB_ADDR_SL21_201,     3000, 0, CID_COND10_REG_COUNT,    s_cond10_data, 0 },
-    { CID_COND_ADDR11, MB_ADDR_SL21_101,     3000, 0, CID_COND11_REG_COUNT,    s_cond11_data, 0 },
+    { CID_AI_CHANNELS, MB_ADDR_WAVESHARE_AI, MB_POLL_PERIOD_AI_MS,   0, CID_AI_REG_COUNT,        s_ai_data,     0 },
+    { CID_FLOW_RATES,  MB_ADDR_URZH2KM,     MB_POLL_PERIOD_FLOW_MS, 0, CID_FLOW_RATE_REG_COUNT, s_flow_data,   0 },
+    { CID_FLOW_VOLUMES,MB_ADDR_URZH2KM,     MB_POLL_PERIOD_VOL_MS,  0, CID_FLOW_VOL_REG_COUNT,  s_volume_data, 0 },
+    { CID_COND_ADDR10, MB_ADDR_SL21_201,    MB_POLL_PERIOD_COND_MS, 0, CID_COND10_REG_COUNT,    s_cond10_data, 0 },
+    { CID_COND_ADDR11, MB_ADDR_SL21_101,    MB_POLL_PERIOD_COND_MS, 0, CID_COND11_REG_COUNT,    s_cond11_data, 0 },
 };
 #define POLL_TABLE_SIZE (sizeof(s_poll_table) / sizeof(s_poll_table[0]))
 
@@ -153,7 +164,7 @@ esp_err_t modbus_poller_init(void)
             .mode             = MB_RTU,
             .port             = BOARD_RS485_UART_PORT,
             .uid              = 0,
-            .response_tout_ms = 1000,
+            .response_tout_ms = MB_RESPONSE_TIMEOUT_MS,
             .baudrate         = BOARD_RS485_BAUDRATE,
             .data_bits        = UART_DATA_8_BITS,
             .stop_bits        = UART_STOP_BITS_1,
@@ -209,7 +220,7 @@ void modbus_poller_task(void *arg)
     ESP_LOGI(TAG, "Задача опроса запущена");
 
     /* Начальная задержка для стабилизации шины */
-    vTaskDelay(pdMS_TO_TICKS(500));
+    vTaskDelay(pdMS_TO_TICKS(MB_BUS_INIT_DELAY_MS));
 
     while (1) {
         int64_t now = esp_timer_get_time() / 1000;  /* мс */
@@ -255,7 +266,7 @@ void modbus_poller_task(void *arg)
             entry->last_poll_ms = now;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(MB_POLL_TASK_INTERVAL_MS));
     }
 }
 

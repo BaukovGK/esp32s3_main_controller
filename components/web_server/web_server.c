@@ -8,6 +8,9 @@
 
 static const char *TAG = "httpd";
 
+#define WEB_MAX_URI_HANDLERS  20    /* 15 используем + запас */
+#define WEB_STACK_SIZE        6144  /* увеличен для cJSON */
+
 static httpd_handle_t s_server = NULL;
 
 /* Внутренние функции регистрации из других .c файлов */
@@ -18,8 +21,8 @@ void web_api_register_commands(httpd_handle_t server);
 esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 20;   /* 15 используем + запас */
-    config.stack_size = 6144;       /* Увеличен для cJSON */
+    config.max_uri_handlers = WEB_MAX_URI_HANDLERS;
+    config.stack_size = WEB_STACK_SIZE;
     config.lru_purge_enable = true;
 
     ESP_LOGI(TAG, "Запуск HTTP-сервера на порту %d...", config.server_port);

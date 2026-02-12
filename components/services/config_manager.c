@@ -15,6 +15,53 @@
 
 static const char *TAG = "config";
 
+/* --- Допустимые диапазоны валидации --- */
+
+/* Давления, бар */
+#define CFG_P1_MAX_LO       1.0f
+#define CFG_P1_MAX_HI       10.0f
+#define CFG_P3_MAX_LO       10.0f
+#define CFG_P3_MAX_HI       60.0f
+#define CFG_P4_MAX_LO       2.0f
+#define CFG_P4_MAX_HI       20.0f
+#define CFG_FILTER_DP_LO    0.5f
+#define CFG_FILTER_DP_HI    3.0f
+
+/* Дозатор, мин */
+#define CFG_DOSER_RUN_LO    1
+#define CFG_DOSER_RUN_HI    60
+#define CFG_DOSER_CYC_LO    10
+#define CFG_DOSER_CYC_HI    1440
+
+/* Промывка */
+#define CFG_WASH_TARGET_LO  20.0f
+#define CFG_WASH_TARGET_HI  40.0f
+#define CFG_WASH_MAX_LO     25.0f
+#define CFG_WASH_MAX_HI     50.0f
+#define CFG_WASH_OVER_LO    30.0f
+#define CFG_WASH_OVER_HI    60.0f
+#define CFG_WASH_HYST_LO    0.5f
+#define CFG_WASH_HYST_HI    10.0f
+#define CFG_WASH_HEAT_LO    5
+#define CFG_WASH_HEAT_HI    120
+#define CFG_WASH_SUP_LO     5
+#define CFG_WASH_SUP_HI     120
+#define CFG_WASH_DRN_LO     1
+#define CFG_WASH_DRN_HI     60
+
+/* Таймауты насосов, мс */
+#define CFG_PUMP_CONF_LO    1000
+#define CFG_PUMP_CONF_HI    10000
+#define CFG_PUMP_RAMP_LO    5000
+#define CFG_PUMP_RAMP_HI    30000
+
+/* MQTT */
+#define CFG_MQTT_INTV_LO    1
+#define CFG_MQTT_INTV_HI    60
+
+/* NVS string load buffer */
+#define NVS_STR_BUF_SIZE    128
+
 static plant_config_t s_config;
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -71,7 +118,7 @@ static void load_i32(const char *key, int32_t *dst)
 
 static void load_str(const char *key, char *dst, size_t max_len)
 {
-    char buf[128];
+    char buf[NVS_STR_BUF_SIZE];
     size_t read_len = (max_len < sizeof(buf)) ? max_len : sizeof(buf);
     if (hal_nvs_get_str(key, buf, read_len) == ESP_OK) {
         strncpy(dst, buf, max_len - 1);
@@ -95,16 +142,16 @@ static int32_t clamp_i32(int32_t val, int32_t min, int32_t max, int32_t def)
 /* Применение валидации к секциям конфига */
 static void validate_pressure(config_pressure_t *p)
 {
-    p->p1_max       = clamp_float(p->p1_max, 1.0f, 10.0f, s_defaults.pressure.p1_max);
-    p->p3_max       = clamp_float(p->p3_max, 10.0f, 60.0f, s_defaults.pressure.p3_max);
-    p->p4_max       = clamp_float(p->p4_max, 2.0f, 20.0f, s_defaults.pressure.p4_max);
-    p->filter_dp_warn = clamp_float(p->filter_dp_warn, 0.5f, 3.0f, s_defaults.pressure.filter_dp_warn);
+    p->p1_max       = clamp_float(p->p1_max, CFG_P1_MAX_LO, CFG_P1_MAX_HI, s_defaults.pressure.p1_max);
+    p->p3_max       = clamp_float(p->p3_max, CFG_P3_MAX_LO, CFG_P3_MAX_HI, s_defaults.pressure.p3_max);
+    p->p4_max       = clamp_float(p->p4_max, CFG_P4_MAX_LO, CFG_P4_MAX_HI, s_defaults.pressure.p4_max);
+    p->filter_dp_warn = clamp_float(p->filter_dp_warn, CFG_FILTER_DP_LO, CFG_FILTER_DP_HI, s_defaults.pressure.filter_dp_warn);
 }
 
 static void validate_doser(config_doser_t *d)
 {
-    d->run_time_min   = clamp_i32(d->run_time_min, 1, 60, s_defaults.doser.run_time_min);
-    d->cycle_time_min = clamp_i32(d->cycle_time_min, 10, 1440, s_defaults.doser.cycle_time_min);
+    d->run_time_min   = clamp_i32(d->run_time_min, CFG_DOSER_RUN_LO, CFG_DOSER_RUN_HI, s_defaults.doser.run_time_min);
+    d->cycle_time_min = clamp_i32(d->cycle_time_min, CFG_DOSER_CYC_LO, CFG_DOSER_CYC_HI, s_defaults.doser.cycle_time_min);
     /* run_time должен быть меньше cycle_time */
     if (d->run_time_min >= d->cycle_time_min) {
         d->run_time_min = s_defaults.doser.run_time_min;
@@ -115,24 +162,24 @@ static void validate_doser(config_doser_t *d)
 
 static void validate_washing(config_washing_t *w)
 {
-    w->target_temp_C    = clamp_float(w->target_temp_C, 20.0f, 40.0f, s_defaults.washing.target_temp_C);
-    w->max_temp_C       = clamp_float(w->max_temp_C, 25.0f, 50.0f, s_defaults.washing.max_temp_C);
-    w->t_overshoot_C    = clamp_float(w->t_overshoot_C, 30.0f, 60.0f, s_defaults.washing.t_overshoot_C);
-    w->hysteresis_C     = clamp_float(w->hysteresis_C, 0.5f, 10.0f, s_defaults.washing.hysteresis_C);
-    w->heat_timeout_min = clamp_i32(w->heat_timeout_min, 5, 120, s_defaults.washing.heat_timeout_min);
-    w->supply_time_min  = clamp_i32(w->supply_time_min, 5, 120, s_defaults.washing.supply_time_min);
-    w->drain_time_min   = clamp_i32(w->drain_time_min, 1, 60, s_defaults.washing.drain_time_min);
+    w->target_temp_C    = clamp_float(w->target_temp_C, CFG_WASH_TARGET_LO, CFG_WASH_TARGET_HI, s_defaults.washing.target_temp_C);
+    w->max_temp_C       = clamp_float(w->max_temp_C, CFG_WASH_MAX_LO, CFG_WASH_MAX_HI, s_defaults.washing.max_temp_C);
+    w->t_overshoot_C    = clamp_float(w->t_overshoot_C, CFG_WASH_OVER_LO, CFG_WASH_OVER_HI, s_defaults.washing.t_overshoot_C);
+    w->hysteresis_C     = clamp_float(w->hysteresis_C, CFG_WASH_HYST_LO, CFG_WASH_HYST_HI, s_defaults.washing.hysteresis_C);
+    w->heat_timeout_min = clamp_i32(w->heat_timeout_min, CFG_WASH_HEAT_LO, CFG_WASH_HEAT_HI, s_defaults.washing.heat_timeout_min);
+    w->supply_time_min  = clamp_i32(w->supply_time_min, CFG_WASH_SUP_LO, CFG_WASH_SUP_HI, s_defaults.washing.supply_time_min);
+    w->drain_time_min   = clamp_i32(w->drain_time_min, CFG_WASH_DRN_LO, CFG_WASH_DRN_HI, s_defaults.washing.drain_time_min);
 }
 
 static void validate_timeouts(config_timeouts_t *t)
 {
-    t->pump_confirm_ms = clamp_i32(t->pump_confirm_ms, 1000, 10000, s_defaults.timeouts.pump_confirm_ms);
-    t->pump_ramp_ms    = clamp_i32(t->pump_ramp_ms, 5000, 30000, s_defaults.timeouts.pump_ramp_ms);
+    t->pump_confirm_ms = clamp_i32(t->pump_confirm_ms, CFG_PUMP_CONF_LO, CFG_PUMP_CONF_HI, s_defaults.timeouts.pump_confirm_ms);
+    t->pump_ramp_ms    = clamp_i32(t->pump_ramp_ms, CFG_PUMP_RAMP_LO, CFG_PUMP_RAMP_HI, s_defaults.timeouts.pump_ramp_ms);
 }
 
 static void validate_mqtt(config_mqtt_t *m)
 {
-    m->publish_interval_s = clamp_i32(m->publish_interval_s, 1, 60, s_defaults.mqtt.publish_interval_s);
+    m->publish_interval_s = clamp_i32(m->publish_interval_s, CFG_MQTT_INTV_LO, CFG_MQTT_INTV_HI, s_defaults.mqtt.publish_interval_s);
     m->enabled = (m->enabled != 0) ? 1 : 0;
     if (m->broker_uri[0] == '\0') {
         strncpy(m->broker_uri, s_defaults.mqtt.broker_uri, sizeof(m->broker_uri));

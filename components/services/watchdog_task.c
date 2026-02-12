@@ -15,8 +15,9 @@
 
 static const char *TAG = "watchdog";
 
-#define WDT_DO_OFF_THRESHOLD   3   /* секунд до отключения DO */
-#define WDT_REBOOT_THRESHOLD  10   /* секунд до перезагрузки */
+#define WDT_CHECK_INTERVAL_MS  1000  /* интервал проверки, мс */
+#define WDT_DO_OFF_THRESHOLD   3     /* секунд до отключения DO */
+#define WDT_REBOOT_THRESHOLD  10     /* секунд до перезагрузки */
 
 /* Счётчик циклов ProcessTask (volatile: один писатель, один читатель) */
 static volatile uint32_t s_cycle_counter = 0;
@@ -33,7 +34,7 @@ void watchdog_task(void *arg)
     int stale_count = 0;
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        vTaskDelay(pdMS_TO_TICKS(WDT_CHECK_INTERVAL_MS));
 
         uint32_t current = s_cycle_counter;
         if (current == last_counter) {

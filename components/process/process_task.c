@@ -17,8 +17,11 @@
 
 static const char *TAG = "process";
 
+/* Период основного цикла, мс */
+#define PROCESS_CYCLE_MS    100
+
 /* Период логирования: 5с / 100мс = 50 циклов */
-#define LOG_PERIOD_CYCLES  50
+#define LOG_PERIOD_CYCLES   50
 
 void process_task(void *arg)
 {
@@ -84,6 +87,6 @@ void process_task(void *arg)
                      isnan(tel->stage2_selectivity) ? 0.0f : tel->stage2_selectivity);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(100));
+        vTaskDelay(pdMS_TO_TICKS(PROCESS_CYCLE_MS));
     }
 }

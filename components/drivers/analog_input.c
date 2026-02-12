@@ -29,6 +29,14 @@ static bool     s_ma_filled;
 /* Порог обрыва: ~0.5% от 65535 → ток ниже ~4.08мА (обрыв провода) */
 #define FAULT_RAW_THRESHOLD  328
 
+/* Параметры 4-20мА токовой петли */
+#define ADC_RAW_MAX             65535.0f
+#define CURRENT_LOOP_MIN_MA     4.0f
+#define CURRENT_LOOP_SPAN_MA    16.0f   /* 20 - 4 мА */
+
+/* Количество активных каналов (P1..T) */
+#define AI_ENABLED_CHANNELS     5
+
 static ai_data_t s_data;
 
 void analog_input_init(void)
@@ -39,7 +47,7 @@ void analog_input_init(void)
     s_config[AI_CH_P4] = (ai_ch_cfg_t){ .range_min = 0.0f, .range_max = 10.0f,  .enabled = true };
     s_config[AI_CH_T]  = (ai_ch_cfg_t){ .range_min = 0.0f, .range_max = 100.0f, .enabled = true };
     /* AI6-AI8: резерв */
-    for (int i = 5; i < AI_CHANNEL_COUNT; i++) {
+    for (int i = AI_ENABLED_CHANNELS; i < AI_CHANNEL_COUNT; i++) {
         s_config[i] = (ai_ch_cfg_t){ .enabled = false };
     }
 
@@ -82,11 +90,11 @@ void analog_input_update(void)
         /* Обрыв датчика */
         s_data.channels[ch].fault = (avg < FAULT_RAW_THRESHOLD);
 
-        /* raw 0..65535 → range_min..range_max */
-        float ratio = (float)avg / 65535.0f;
+        /* raw 0..ADC_RAW_MAX → range_min..range_max */
+        float ratio = (float)avg / ADC_RAW_MAX;
         s_data.channels[ch].value = s_config[ch].range_min +
                                     ratio * (s_config[ch].range_max - s_config[ch].range_min);
-        s_data.channels[ch].raw_ma = 4.0f + ratio * 16.0f;
+        s_data.channels[ch].raw_ma = CURRENT_LOOP_MIN_MA + ratio * CURRENT_LOOP_SPAN_MA;
         s_data.channels[ch].valid = s_data.device_online && !s_data.channels[ch].fault;
     }
 }

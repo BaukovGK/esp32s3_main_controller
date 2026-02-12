@@ -16,6 +16,16 @@
 
 static const char *TAG = "cond_drv";
 
+/* Коэффициенты преобразования СЛ21 */
+#define SL21_COND_DIVISOR   100.0f   /* raw → µS/cm */
+#define SL21_TEMP_DIVISOR   10.0f    /* raw → °C */
+
+/* Смещения регистров в блоке канала (3 рег на канал) */
+#define SL21_REG_COND_HI   0
+#define SL21_REG_COND_LO   1
+#define SL21_REG_TEMP       2
+#define SL21_CH_STRIDE      3   /* регистров на канал */
+
 static conductivity_data_t s_data;
 
 static uint32_t regs_to_uint32(uint16_t hi, uint16_t lo)
@@ -41,21 +51,22 @@ void conductivity_update(void)
     s_data.device11_online = modbus_poller_is_device_online(MB_ADDR_SL21_101);
 
     /* Addr 10, канал 1: σ1 */
-    uint32_t raw1 = regs_to_uint32(c10[0], c10[1]);
-    s_data.conductivity_uS[COND_CH_FEED] = (float)raw1 / 100.0f;
-    s_data.temperature_C[COND_CH_FEED]   = (int16_t)c10[2] / 10.0f;
+    uint32_t raw1 = regs_to_uint32(c10[SL21_REG_COND_HI], c10[SL21_REG_COND_LO]);
+    s_data.conductivity_uS[COND_CH_FEED] = (float)raw1 / SL21_COND_DIVISOR;
+    s_data.temperature_C[COND_CH_FEED]   = (int16_t)c10[SL21_REG_TEMP] / SL21_TEMP_DIVISOR;
     s_data.channel_ok[COND_CH_FEED]      = s_data.device10_online;
 
     /* Addr 10, канал 2: σ2 */
-    uint32_t raw2 = regs_to_uint32(c10[3], c10[4]);
-    s_data.conductivity_uS[COND_CH_PERM1] = (float)raw2 / 100.0f;
-    s_data.temperature_C[COND_CH_PERM1]   = (int16_t)c10[5] / 10.0f;
+    uint32_t raw2 = regs_to_uint32(c10[SL21_CH_STRIDE + SL21_REG_COND_HI],
+                                   c10[SL21_CH_STRIDE + SL21_REG_COND_LO]);
+    s_data.conductivity_uS[COND_CH_PERM1] = (float)raw2 / SL21_COND_DIVISOR;
+    s_data.temperature_C[COND_CH_PERM1]   = (int16_t)c10[SL21_CH_STRIDE + SL21_REG_TEMP] / SL21_TEMP_DIVISOR;
     s_data.channel_ok[COND_CH_PERM1]      = s_data.device10_online;
 
     /* Addr 11, канал 1: σ3 */
-    uint32_t raw3 = regs_to_uint32(c11[0], c11[1]);
-    s_data.conductivity_uS[COND_CH_PERM2] = (float)raw3 / 100.0f;
-    s_data.temperature_C[COND_CH_PERM2]   = (int16_t)c11[2] / 10.0f;
+    uint32_t raw3 = regs_to_uint32(c11[SL21_REG_COND_HI], c11[SL21_REG_COND_LO]);
+    s_data.conductivity_uS[COND_CH_PERM2] = (float)raw3 / SL21_COND_DIVISOR;
+    s_data.temperature_C[COND_CH_PERM2]   = (int16_t)c11[SL21_REG_TEMP] / SL21_TEMP_DIVISOR;
     s_data.channel_ok[COND_CH_PERM2]      = s_data.device11_online;
 }
 

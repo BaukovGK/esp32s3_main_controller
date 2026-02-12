@@ -41,6 +41,19 @@
 
 static const char *TAG = "app_main";
 
+/* --- Параметры задач: стек (байт) и приоритет --- */
+#define TASK_MODBUS_STACK   4096
+#define TASK_MODBUS_PRIO    6
+#define TASK_IO_STACK       2048
+#define TASK_IO_PRIO        6
+#define TASK_PROCESS_STACK  8192
+#define TASK_PROCESS_PRIO   5
+#define TASK_WDT_STACK      2048
+#define TASK_WDT_PRIO       7
+
+/* Период задачи IO (debounce + E-STOP), мс */
+#define IO_TASK_CYCLE_MS    10
+
 /* --- Ethernet event handlers --- */
 
 static void eth_event_handler(void *arg, esp_event_base_t event_base,
@@ -101,7 +114,7 @@ static void io_task(void *arg)
             prev_di = di;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(IO_TASK_CYCLE_MS));
     }
 }
 
@@ -184,13 +197,13 @@ void app_main(void)
 
     /* 10. Запуск задач */
     TaskHandle_t h;
-    xTaskCreate(modbus_poller_task, "modbus",  4096, NULL, 6, &h);
+    xTaskCreate(modbus_poller_task, "modbus",  TASK_MODBUS_STACK,  NULL, TASK_MODBUS_PRIO,  &h);
     diagnostics_register_task("modbus", h);
-    xTaskCreate(io_task,            "io",      2048, NULL, 6, &h);
+    xTaskCreate(io_task,            "io",      TASK_IO_STACK,      NULL, TASK_IO_PRIO,      &h);
     diagnostics_register_task("io", h);
-    xTaskCreate(process_task,       "process", 8192, NULL, 5, &h);
+    xTaskCreate(process_task,       "process", TASK_PROCESS_STACK, NULL, TASK_PROCESS_PRIO, &h);
     diagnostics_register_task("process", h);
-    xTaskCreate(watchdog_task,      "watchdog",2048, NULL, 7, &h);
+    xTaskCreate(watchdog_task,      "watchdog",TASK_WDT_STACK,     NULL, TASK_WDT_PRIO,     &h);
     diagnostics_register_task("watchdog", h);
 
     /* 11. HTTP-сервер + REST API */

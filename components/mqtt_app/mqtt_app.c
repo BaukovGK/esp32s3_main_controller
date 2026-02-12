@@ -34,7 +34,15 @@ static TaskHandle_t s_task_handle = NULL;
 static volatile bool s_connected = false;
 
 /* Потокобезопасная очередь аварий (FreeRTOS queue) */
-#define ALARM_QUEUE_SIZE 16
+#define ALARM_QUEUE_SIZE        16
+
+/* Параметры задачи и публикации */
+#define MQTT_TASK_STACK_SIZE    8192
+#define MQTT_TASK_PRIORITY      4
+#define MQTT_DIAG_CYCLE         6       /* публикация диагностики каждый N-й интервал */
+#define MQTT_RECONNECT_MS       5000
+#define MQTT_LWT_MSG            "offline"
+
 static QueueHandle_t s_alarm_queue = NULL;
 
 /* --- Callback аварий для alarm_manager --- */
@@ -131,8 +139,8 @@ static void mqtt_task(void *arg)
         /* Периодическая публикация полного статуса */
         mqtt_publish_full_status(s_client);
 
-        /* Диагностика — каждый 6-й цикл (~30с при интервале 5с) */
-        if (++diag_counter >= 6) {
+        /* Диагностика — каждый N-й цикл (~30с при интервале 5с) */
+        if (++diag_counter >= MQTT_DIAG_CYCLE) {
             mqtt_publish_diagnostics(s_client);
             diag_counter = 0;
         }
@@ -167,12 +175,12 @@ esp_err_t mqtt_app_start(void)
         .credentials.client_id = cfg->client_id,
         .session.last_will = {
             .topic = "ro_plant/availability",
-            .msg = "offline",
-            .msg_len = 7,
+            .msg = MQTT_LWT_MSG,
+            .msg_len = sizeof(MQTT_LWT_MSG) - 1,
             .qos = 1,
             .retain = true,
         },
-        .network.reconnect_timeout_ms = 5000,
+        .network.reconnect_timeout_ms = MQTT_RECONNECT_MS,
     };
 
     /* Авторизация (если задана) */
@@ -205,7 +213,7 @@ esp_err_t mqtt_app_start(void)
     }
 
     /* Создаём задачу публикации */
-    BaseType_t ok = xTaskCreate(mqtt_task, "mqtt", 8192, NULL, 4, &s_task_handle);
+    BaseType_t ok = xTaskCreate(mqtt_task, "mqtt", MQTT_TASK_STACK_SIZE, NULL, MQTT_TASK_PRIORITY, &s_task_handle);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "Не удалось создать MqttTask");
         esp_mqtt_client_stop(s_client);
