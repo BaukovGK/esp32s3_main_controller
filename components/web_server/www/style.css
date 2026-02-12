@@ -1,0 +1,101 @@
+:root {
+  --bg: #1a1a2e;
+  --card: #16213e;
+  --hdr: #0f3460;
+  --ok: #00ff88;
+  --warn: #ffa500;
+  --err: #e94560;
+  --txt: #e0e0e0;
+  --dim: #888;
+  --border: #2a2a4e;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--txt); font-family: system-ui, sans-serif; font-size: 14px; padding: 8px; max-width: 900px; margin: 0 auto; }
+header { background: var(--hdr); padding: 12px 16px; border-radius: 8px; display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+header h1 { font-size: 18px; }
+footer { text-align: center; color: var(--dim); padding: 12px; font-size: 12px; display: flex; justify-content: space-between; }
+section { background: var(--card); border-radius: 8px; padding: 12px; margin-bottom: 10px; }
+h2 { font-size: 14px; color: var(--dim); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
+h3 { font-size: 13px; color: var(--dim); margin: 8px 0 4px; }
+
+/* LED индикатор связи */
+.led { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+.led.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+.led.off { background: var(--err); box-shadow: 0 0 6px var(--err); }
+
+/* Раскладки */
+.row { display: flex; gap: 8px; flex-wrap: wrap; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; }
+.card { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px; text-align: center; flex: 1; min-width: 100px; }
+.card label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 4px; }
+.card .big { font-size: 20px; font-family: monospace; font-weight: bold; }
+.card .val { font-size: 18px; font-family: monospace; font-weight: bold; }
+.card .unit { font-size: 11px; color: var(--dim); }
+.card .sub { font-size: 11px; color: var(--dim); margin-top: 2px; }
+.card.fault { border-color: var(--err); }
+.card.fault .val { color: var(--err); }
+
+/* Кнопки */
+.btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.btn { border: none; border-radius: 6px; padding: 10px 16px; font-size: 13px; font-weight: bold; cursor: pointer; color: #fff; transition: opacity 0.2s; }
+.btn:hover { opacity: 0.85; }
+.btn:active { opacity: 0.7; }
+.btn.green { background: #27ae60; }
+.btn.red { background: #c0392b; }
+.btn.yellow { background: #f39c12; color: #000; }
+.btn.gray { background: #555; }
+.btn.blue { background: #2980b9; }
+.btn.small { padding: 6px 12px; font-size: 12px; }
+
+/* Состояния */
+.st-idle { color: var(--dim); }
+.st-auto { color: var(--ok); }
+.st-washing { color: var(--warn); }
+.st-manual { color: #56c0f0; }
+.st-fault { color: var(--err); animation: blink 0.8s infinite; }
+@keyframes blink { 50% { opacity: 0.4; } }
+
+/* DI/DO */
+.dio-row { display: flex; gap: 16px; flex-wrap: wrap; }
+.dio-row > div { display: flex; align-items: center; gap: 6px; }
+.dio { display: flex; gap: 3px; }
+.dio .bit { width: 18px; height: 18px; border-radius: 3px; display: flex; align-items: center; justify-content: center; font-size: 10px; font-family: monospace; }
+.bit.on { background: var(--ok); color: #000; }
+.bit.off { background: #333; color: #666; }
+
+/* Блокировки */
+.ilk-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 4px; }
+.ilk-item { display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 4px; }
+.ilk-item .dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.ilk-item .dot.active { background: var(--err); }
+.ilk-item .dot.ok { background: var(--ok); }
+
+/* Ручное управление */
+.manual-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 6px; }
+.manual-item { display: flex; align-items: center; justify-content: space-between; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 8px; font-size: 12px; }
+.toggle { width: 40px; height: 22px; border-radius: 11px; background: #444; cursor: pointer; position: relative; border: none; }
+.toggle.on { background: var(--ok); }
+.toggle::after { content: ''; width: 18px; height: 18px; border-radius: 50%; background: #fff; position: absolute; top: 2px; left: 2px; transition: left 0.2s; }
+.toggle.on::after { left: 20px; }
+
+/* Аварии */
+.alarm-grid { display: flex; flex-direction: column; gap: 4px; }
+.alarm-item { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 6px 8px; border-radius: 4px; border-left: 3px solid var(--dim); }
+.alarm-item.cat-CRITICAL { border-left-color: var(--err); background: rgba(233,69,96,0.1); }
+.alarm-item.cat-ALARM { border-left-color: var(--warn); background: rgba(255,165,0,0.1); }
+.alarm-item.cat-WARNING { border-left-color: #f1c40f; background: rgba(241,196,15,0.08); }
+.alarm-item.cat-INFO { border-left-color: #56c0f0; background: rgba(86,192,240,0.08); }
+.alarm-item .alarm-cat { font-weight: bold; min-width: 65px; }
+.alarm-item.cat-CRITICAL .alarm-cat { color: var(--err); }
+.alarm-item.cat-ALARM .alarm-cat { color: var(--warn); }
+.alarm-item.cat-WARNING .alarm-cat { color: #f1c40f; }
+.alarm-item.cat-INFO .alarm-cat { color: #56c0f0; }
+.alarm-item .alarm-time { color: var(--dim); min-width: 70px; }
+.alarm-badge { background: var(--err); color: #fff; border-radius: 10px; font-size: 11px; padding: 1px 7px; margin-left: 6px; }
+
+/* Настройки */
+details summary { cursor: pointer; }
+.cfg-group { border-top: 1px solid var(--border); padding: 8px 0; }
+.cfg-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
+.cfg-row label { display: flex; flex-direction: column; font-size: 11px; color: var(--dim); gap: 2px; }
+.cfg-row input { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--txt); padding: 6px; font-size: 13px; width: 120px; }
