@@ -50,7 +50,7 @@
 | `INTERLOCK_PUMP1_TIMEOUT` | `(1 << 8)` = `0x0100` | Таймаут подтверждения насоса подачи (DI6 не появился в течение `pump_confirm_ms`). Используется в `state_machine.c`, а не в `interlocks.c`. |
 | `INTERLOCK_PUMP2_TIMEOUT` | `(1 << 9)` = `0x0200` | Таймаут подтверждения насоса 1-й ступени (DI7). Аналогично. |
 | `INTERLOCK_PUMP3_TIMEOUT` | `(1 << 10)` = `0x0400` | Таймаут подтверждения насоса 2-й ступени (DI8). Аналогично. |
-| `INTERLOCK_SENSOR_FAULT_P1` | `(1 << 11)` = `0x0800` | **Phase-1**: датчик P1 неисправен (NaN от `analog_input` — обрыв 4-20 мА или offline Modbus). Блокирует: `pump_feed`. |
+| `INTERLOCK_SENSOR_FAULT_P1` | `(1 << 11)` = `0x0800` | **Phase-1**: датчик P1 неисправен (NaN от `analog_input` — обрыв 4–20 мА (raw < 3500 мкА), КЗ (raw > 20500 мкА) или offline Modbus). Блокирует: `pump_feed`. |
 | `INTERLOCK_SENSOR_FAULT_P3` | `(1 << 12)` = `0x1000` | **Phase-1**: датчик P3 неисправен. Блокирует: `pump_stage1`. |
 | `INTERLOCK_SENSOR_FAULT_P4` | `(1 << 13)` = `0x2000` | **Phase-1**: датчик P4 неисправен. Блокирует: `pump_stage2`. |
 | `INTERLOCK_SENSOR_FAULT_T` | `(1 << 14)` = `0x4000` | **Phase-1**: датчик температуры неисправен. Блокирует: `heater`. |
@@ -152,6 +152,12 @@ void interlocks_check(bool manual_mode, interlock_result_t *result);
    - Чтение P1, P2, P3, P4 через `analog_input_get_value()`.
    - **Phase-1 (отказоустойчивость):** NaN теперь трактуется как **отказ датчика** и блокирует
      соответствующий агрегат (без блокировки система продолжала бы работать без верхней защиты по давлению).
+     NaN возвращается из `analog_input` при любом из условий неисправности 4–20 мА:
+     - **обрыв линии:** `raw < FAULT_BREAK_UA` (3500 мкА, ~3.5 мА);
+     - **короткое замыкание:** `raw > FAULT_SHORT_UA` (20500 мкА, ~20.5 мА);
+     - **offline Modbus** (slave не отвечает).
+
+     Действия:
      - `isnan(P1)`: флаг `INTERLOCK_SENSOR_FAULT_P1`, запрет `allow_pump_feed`.
      - `isnan(P3)`: флаг `INTERLOCK_SENSOR_FAULT_P3`, запрет `allow_pump_stage1`.
      - `isnan(P4)`: флаг `INTERLOCK_SENSOR_FAULT_P4`, запрет `allow_pump_stage2`.
@@ -161,7 +167,7 @@ void interlocks_check(bool manual_mode, interlock_result_t *result);
      - **P4 > p4_max:** флаг `INTERLOCK_P4_HIGH`, запрет `allow_pump_stage2`.
 
 6. **Проверка температуры:**
-   - **isnan(T):** флаг `INTERLOCK_SENSOR_FAULT_T`, запрет `allow_heater` (Phase-1).
+   - **isnan(T):** флаг `INTERLOCK_SENSOR_FAULT_T`, запрет `allow_heater` (Phase-1; включает обрыв, КЗ и offline Modbus — те же условия, что и для датчиков давления).
    - **T > t_overshoot_C:** флаг `INTERLOCK_T_HIGH`, запрет `allow_heater`.
 
 7. **Проверка перепада давления на фильтре:**

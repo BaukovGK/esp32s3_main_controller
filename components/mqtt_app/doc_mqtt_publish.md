@@ -210,7 +210,7 @@ void mqtt_publish_full_status(esp_mqtt_client_handle_t client);
 
 **Топики:** `ro_plant/status/conductivity/{name}` (QoS 0, без Retain)
 
-Где `{name}` принимает значения: `s1`, `s2`, `s3`.
+Где `{name}` принимает значения: `s1`, `s2`, `s3`, `s4` (4 канала, `COND_CHANNEL_COUNT = 4`).
 
 ```json
 {
@@ -228,11 +228,12 @@ void mqtt_publish_full_status(esp_mqtt_client_handle_t client);
 
 **Датчики:**
 
-| Имя | Назначение |
-|-----|------------|
-| `s1` | Кондуктивность входной воды (Feed) |
-| `s2` | Кондуктивность пермеата 1-й ступени |
-| `s3` | Кондуктивность пермеата 2-й ступени |
+| Имя | Источник Modbus | Назначение |
+|-----|-----------------|------------|
+| `s1` | slave 10 (SL21-201) X1/t1 | Кондуктивность входной (питательной) воды (Feed) |
+| `s2` | slave 10 X2/t2 | Кондуктивность пермеата 1-й ступени |
+| `s3` | slave 11 (SL21-101) X1/t1 | Кондуктивность пермеата 2-й ступени (товарный) |
+| `s4` | slave 11 X2/t2 | Кондуктивность концентрата (добавлен 2026-05-09) |
 
 ##### 6.1.6. Telemetry -- вычисленные параметры
 
@@ -408,8 +409,8 @@ void mqtt_publish_diagnostics(esp_mqtt_client_handle_t client);
 | `heap_min` | число | Минимальный объём свободной кучи за время работы (байт) |
 | `uptime_s` | число | Время работы системы (секунды, конвертируется из микросекунд) |
 | `stack` | объект | Словарь: имя задачи -> свободный стек (байт). Перечисляются все зарегистрированные задачи. |
-| `modbus.errors` | массив[4] | Количество ошибок Modbus по каждому из 4 устройств |
-| `modbus.online` | массив[4] | Статус онлайн каждого из 4 Modbus-устройств |
+| `modbus.errors` | массив | Количество ошибок Modbus по каждому slave-устройству. Размер — динамический (по `mb_count` из `diagnostics_data_t`); список slaves берётся из `modbus_poller_get_slave_addrs` и дедуплицируется. |
+| `modbus.online` | массив | Статус онлайн каждого slave-устройства Modbus. Размер совпадает с `modbus.errors`. |
 | `wdt_stale` | число | Флаг "зависших" задач Watchdog (всегда 0 в текущей реализации) |
 
 ---
@@ -666,14 +667,15 @@ static void add_device_obj(cJSON *root);
 | 10 | `ro_plant/status/flow/Q2` | 0 | Нет | Каждый цикл | Расходомер Q2 |
 | 11 | `ro_plant/status/flow/Q3` | 0 | Нет | Каждый цикл | Расходомер Q3 |
 | 12 | `ro_plant/status/flow/Q4` | 0 | Нет | Каждый цикл | Расходомер Q4 |
-| 13 | `ro_plant/status/conductivity/s1` | 0 | Нет | Каждый цикл | Кондуктометр Feed |
-| 14 | `ro_plant/status/conductivity/s2` | 0 | Нет | Каждый цикл | Кондуктометр Perm1 |
-| 15 | `ro_plant/status/conductivity/s3` | 0 | Нет | Каждый цикл | Кондуктометр Perm2 |
-| 16 | `ro_plant/status/telemetry` | 0 | Нет | Каждый цикл | Вычисленные параметры |
-| 17 | `ro_plant/status/doser` | 0 | Нет | Каждый цикл | Состояние дозатора |
-| 18 | `ro_plant/status/interlocks` | 0 | Нет | Каждый цикл | Блокировки |
-| 19 | `ro_plant/status/diagnostics` | 0 | Нет | Каждый 6-й цикл | Диагностика |
-| 20 | `ro_plant/alarms` | 1 | Нет | По событию | Аварийные события |
+| 13 | `ro_plant/status/conductivity/s1` | 0 | Нет | Каждый цикл | Кондуктометр Feed (slave 10 X1) |
+| 14 | `ro_plant/status/conductivity/s2` | 0 | Нет | Каждый цикл | Кондуктометр Perm1 (slave 10 X2) |
+| 15 | `ro_plant/status/conductivity/s3` | 0 | Нет | Каждый цикл | Кондуктометр Perm2 (slave 11 X1) |
+| 16 | `ro_plant/status/conductivity/s4` | 0 | Нет | Каждый цикл | Кондуктометр Conc (slave 11 X2) |
+| 17 | `ro_plant/status/telemetry` | 0 | Нет | Каждый цикл | Вычисленные параметры |
+| 18 | `ro_plant/status/doser` | 0 | Нет | Каждый цикл | Состояние дозатора |
+| 19 | `ro_plant/status/interlocks` | 0 | Нет | Каждый цикл | Блокировки |
+| 20 | `ro_plant/status/diagnostics` | 0 | Нет | Каждый 6-й цикл | Диагностика |
+| 21 | `ro_plant/alarms` | 1 | Нет | По событию | Аварийные события |
 
 ---
 
@@ -712,6 +714,8 @@ static void add_device_obj(cJSON *root);
 | 12 | `ro_plant_s1` | RO Feed Conductivity | `ro_plant/status/conductivity/s1` | `{{ value_json.conductivity }}` | uS/cm | -- | `mdi:flash` | `sensor` |
 | 13 | `ro_plant_s2` | RO Perm1 Conductivity | `ro_plant/status/conductivity/s2` | `{{ value_json.conductivity }}` | uS/cm | -- | `mdi:flash` | `sensor` |
 | 14 | `ro_plant_s3` | RO Perm2 Conductivity | `ro_plant/status/conductivity/s3` | `{{ value_json.conductivity }}` | uS/cm | -- | `mdi:flash` | `sensor` |
+
+> **Примечание:** В MQTT публикуется 4 канала (`s1..s4`, `COND_CHANNEL_COUNT = 4`), но HA Discovery пока зарегистрирован только для трёх. Регистрация `ro_plant_s4` (концентрат) — TODO; будет добавлено вместе с расширением `s_ha_entities`.
 
 ### 8.5. Группа: Телеметрия (4 sensor)
 

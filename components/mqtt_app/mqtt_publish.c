@@ -101,8 +101,10 @@ void mqtt_publish_full_status(esp_mqtt_client_handle_t client)
         esp_mqtt_client_publish(client, topic, buf, 0, 0, 0);
     }
 
-    /* 5. Conductivity */
-    static const char *cond_names[] = {"s1", "s2", "s3"};
+    /* 5. Conductivity (4 канала с 2026-05-09 — добавлен s4=концентрат) */
+    static const char *cond_names[] = {"s1", "s2", "s3", "s4"};
+    _Static_assert(sizeof(cond_names) / sizeof(cond_names[0]) == COND_CHANNEL_COUNT,
+                   "cond_names must have COND_CHANNEL_COUNT entries");
     conductivity_data_t cd;
     conductivity_get_data(&cd);
 
@@ -270,6 +272,8 @@ static const ha_entity_t s_ha_entities[] = {
     {"ro_plant_s2", "RO Perm1 Conductivity", "ro_plant/status/conductivity/s2",
      "{{ value_json.conductivity }}", "\xC2\xB5S/cm", NULL, "mdi:flash", "sensor"},
     {"ro_plant_s3", "RO Perm2 Conductivity", "ro_plant/status/conductivity/s3",
+     "{{ value_json.conductivity }}", "\xC2\xB5S/cm", NULL, "mdi:flash", "sensor"},
+    {"ro_plant_s4", "RO Concentrate Conductivity", "ro_plant/status/conductivity/s4",
      "{{ value_json.conductivity }}", "\xC2\xB5S/cm", NULL, "mdi:flash", "sensor"},
 
     /* Телеметрия */

@@ -127,7 +127,11 @@
 | P4 | `ro_plant/status/analog/P4` | bar | 0 — 10 |
 | T | `ro_plant/status/analog/T` | °C | 0 — 100 |
 
-**`fault`** = true при обрыве датчика (ток < 4 мА), `value` = `null` при NaN.
+**`fault`** = true при неисправности датчика 4–20 мА:
+- **обрыв линии** (ток < 3.5 мА, raw < 3500 мкА);
+- **короткое замыкание** (ток > 20.5 мА, raw > 20500 мкА).
+
+При `fault = true` поле `value` = `null` (внутри передаётся NaN).
 
 ---
 
@@ -159,7 +163,7 @@
 ### 2.5 Кондуктометры
 
 **Топик:** `ro_plant/status/conductivity/{NAME}`
-где `{NAME}` = `s1`, `s2`, `s3`
+где `{NAME}` = `s1`, `s2`, `s3`, `s4`
 
 ```json
 {
@@ -169,14 +173,16 @@
 }
 ```
 
-| Канал | Топик | Описание |
-|-------|-------|----------|
-| σ1 | `ro_plant/status/conductivity/s1` | Исходная вода |
-| σ2 | `ro_plant/status/conductivity/s2` | Пермеат 1-й ступени |
-| σ3 | `ro_plant/status/conductivity/s3` | Пермеат 2-й ступени |
+| Канал | Топик | Источник | Описание |
+|-------|-------|----------|----------|
+| σ1 | `ro_plant/status/conductivity/s1` | slave 10 (SL21-201) X1/t1 | Исходная (питательная) вода |
+| σ2 | `ro_plant/status/conductivity/s2` | slave 10 X2/t2 | Пермеат 1-й ступени |
+| σ3 | `ro_plant/status/conductivity/s3` | slave 11 (SL21-101) X1/t1 | Пермеат 2-й ступени (товарный) |
+| σ4 | `ro_plant/status/conductivity/s4` | slave 11 X2/t2 | Концентрат |
 
 - `conductivity` — удельная электропроводность, мкСм/см
 - `temperature` — температура раствора в точке замера, °C
+- 4 логических канала собираются из двух 2-канальных приборов СЛ21 (адреса 10 и 11). Расширение с 3 до 4 каналов выполнено 2026-05-09.
 
 ---
 
@@ -301,12 +307,19 @@
 ```
 
 **`modbus.online` / `modbus.errors` — по индексу:**
+
+Список Modbus-устройств формируется динамически опросчиком (`modbus_poller_get_slave_addrs`) с дедупликацией по slave-адресу. Текущий перечень (порядок соответствует порядку появления в таблице опроса):
+
 | Индекс | Адрес | Устройство |
 |--------|-------|------------|
-| 0 | 1 | Waveshare AI 8CH |
+| 0 | 1 | Waveshare AI 8CH (4–20 мА аналоговые входы) |
 | 1 | 2 | УРЖ2КМ (расходомер) |
-| 2 | 10 | СЛ21-201 (2-канальный кондуктометр) |
-| 3 | 11 | СЛ21-101 (1-канальный кондуктометр) |
+| 2 | 10 | СЛ21-201 (2-канальный кондуктометр: σ1, σ2) |
+| 3 | 11 | СЛ21-101 (2-канальный кондуктометр: σ3, σ4) |
+| 4 | 20 | KWS-306L (трёхфазный счётчик НД-насоса, опрос 2 с) |
+| 5 | 21 | KWS-306L (трёхфазный счётчик ВД-насоса, опрос 2 с) |
+
+Размер массивов `modbus.online` / `modbus.errors` в JSON равен фактическому числу slave-адресов; при добавлении новых устройств в `modbus_poller` они автоматически попадают в этот список.
 
 ---
 
@@ -500,9 +513,10 @@ ro_plant/
 │   │   ├── Q3                      → {flow, volume, ok}
 │   │   └── Q4                      → {flow, volume, ok}
 │   ├── conductivity/
-│   │   ├── s1                      → {conductivity, temperature, ok}
-│   │   ├── s2                      → {conductivity, temperature, ok}
-│   │   └── s3                      → {conductivity, temperature, ok}
+│   │   ├── s1                      → {conductivity, temperature, ok}  (Feed)
+│   │   ├── s2                      → {conductivity, temperature, ok}  (Perm1)
+│   │   ├── s3                      → {conductivity, temperature, ok}  (Perm2)
+│   │   └── s4                      → {conductivity, temperature, ok}  (Conc)
 │   ├── telemetry                   → {filter_dp, stage1_feed, recovery2, recovery_sys, sel1, sel2}
 │   ├── doser                       → {state, enabled}
 │   ├── interlocks                  → {flags, estop, filter_warn}
