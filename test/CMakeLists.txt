@@ -184,3 +184,15 @@ add_host_test(test_power_meter
     SRCS test_power_meter.c "${COMP_DIR}/drivers/power_meter.c"
     LIBS mocks_drivers
 )
+
+# 11. test_mb_device_check: real mb_device_check.c + все драйверы + alarm_manager
+# (проверяет автокоррекцию AI mode и sanity-проверки sensors).
+add_host_test(test_mb_device_check
+    SRCS test_mb_device_check.c
+         "${COMP_DIR}/drivers/mb_device_check.c"
+         "${COMP_DIR}/drivers/flowmeter.c"
+         "${COMP_DIR}/drivers/conductivity.c"
+         "${COMP_DIR}/drivers/power_meter.c"
+         "${COMP_DIR}/services/alarm_manager.c"
+    LIBS mocks_drivers
+)

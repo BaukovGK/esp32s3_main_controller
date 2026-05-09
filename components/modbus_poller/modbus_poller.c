@@ -32,6 +32,11 @@ static const char *TAG = "mb_poller";
 #define MB_POLL_PERIOD_COND_MS    3000
 #define MB_POLL_PERIOD_KWS_MS     2000  /* KWS-306L: U/I/P/E раз в 2 секунды */
 
+/* --- Modbus function codes (literals — mb_proto.h приватный в esp-modbus v2) --- */
+#define MB_FC_READ_HOLDING_REGISTER     0x03
+#define MB_FC_WRITE_REGISTER            0x06
+#define MB_FC_WRITE_MULTIPLE_REGISTERS  0x10
+
 /* --- Прочие таймауты --- */
 #define MB_RESPONSE_TIMEOUT_MS    300   /* Phase-1: было 1000, для отзывчивости */
 #define MB_BUS_INIT_DELAY_MS      500
@@ -216,6 +221,54 @@ static const mb_parameter_descriptor_t s_device_params[] = {
         .param_offset   = 0,
         .param_type     = PARAM_TYPE_ASCII,
         .param_size     = CID_KWS_REG_COUNT * 2,
+        .param_opts     = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
+        .access         = PAR_PERMS_READ
+    },
+    /* --- Health-check (mb_device_check) --- */
+    /* CID_AI_MODES: Waveshare AI, holding 0x1000..0x1007, RW (one-time setup
+     * для перевода каналов в режим 4–20mA). В s_poll_table[] не входит —
+     * читается/пишется напрямую через mbc_master_send_request. */
+    {
+        .cid            = CID_AI_MODES,
+        .param_key      = "AI_modes",
+        .param_units    = "raw",
+        .mb_slave_addr  = MB_ADDR_WAVESHARE_AI,
+        .mb_param_type  = MB_PARAM_HOLDING,
+        .mb_reg_start   = 0x1000,
+        .mb_size        = CID_AI_MODES_COUNT,
+        .param_offset   = 0,
+        .param_type     = PARAM_TYPE_ASCII,
+        .param_size     = CID_AI_MODES_COUNT * 2,
+        .param_opts     = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
+        .access         = PAR_PERMS_READ_WRITE
+    },
+    /* CID_AI_VERSION: Waveshare AI, holding 0x8000, R-only — FW version */
+    {
+        .cid            = CID_AI_VERSION,
+        .param_key      = "AI_ver",
+        .param_units    = "raw",
+        .mb_slave_addr  = MB_ADDR_WAVESHARE_AI,
+        .mb_param_type  = MB_PARAM_HOLDING,
+        .mb_reg_start   = 0x8000,
+        .mb_size        = CID_AI_VERSION_COUNT,
+        .param_offset   = 0,
+        .param_type     = PARAM_TYPE_ASCII,
+        .param_size     = CID_AI_VERSION_COUNT * 2,
+        .param_opts     = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
+        .access         = PAR_PERMS_READ
+    },
+    /* CID_AI_DEV_ADDR: Waveshare AI, holding 0x4000, R-only — slave address */
+    {
+        .cid            = CID_AI_DEV_ADDR,
+        .param_key      = "AI_addr",
+        .param_units    = "raw",
+        .mb_slave_addr  = MB_ADDR_WAVESHARE_AI,
+        .mb_param_type  = MB_PARAM_HOLDING,
+        .mb_reg_start   = 0x4000,
+        .mb_size        = CID_AI_DEV_ADDR_COUNT,
+        .param_offset   = 0,
+        .param_type     = PARAM_TYPE_ASCII,
+        .param_size     = CID_AI_DEV_ADDR_COUNT * 2,
         .param_opts     = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
         .access         = PAR_PERMS_READ
     },
@@ -539,4 +592,66 @@ size_t modbus_poller_get_slave_addrs(uint8_t *out, size_t max_cnt)
     }
     data_unlock();
     return n;
+}
+
+/* --- Однократные holding read/write через esp-modbus low-level API ---
+ *
+ * Для health-check'а нам нужно ходить в регистры устройства, не входящие в
+ * циклический опрос (FW version, channel modes, device addr). esp-modbus v2
+ * предоставляет mbc_master_send_request() — синхронный запрос с
+ * сериализацией доступа к шине внутри стека, поэтому брать s_data_mutex не
+ * требуется. Регистры передаются массивом uint16_t в host-endian, библиотека
+ * сама делает byte-swap при формировании PDU. */
+
+esp_err_t modbus_poller_read_holding(uint8_t slave, uint16_t addr,
+                                     uint16_t *out, size_t count)
+{
+    if (out == NULL || count == 0 || count > 125) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_master_ctx == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    mb_param_request_t req = {
+        .slave_addr = slave,
+        .command    = MB_FC_READ_HOLDING_REGISTER,
+        .reg_start  = addr,
+        .reg_size   = (uint16_t)count,
+    };
+    esp_err_t err = mbc_master_send_request(s_master_ctx, &req, out);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "read_holding slave=%d addr=0x%04X cnt=%u: %s",
+                 slave, addr, (unsigned)count, esp_err_to_name(err));
+    }
+    return err;
+}
+
+esp_err_t modbus_poller_write_holding(uint8_t slave, uint16_t addr,
+                                      const uint16_t *data, size_t count)
+{
+    if (data == NULL || count == 0 || count > 123) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_master_ctx == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Phase: при count==1 используем FC 0x06 — он короче в эфире и не
+     * требует префикса byte-count. Остальные счётчики идут через 0x10. */
+    mb_param_request_t req = {
+        .slave_addr = slave,
+        .command    = (count == 1) ? MB_FC_WRITE_REGISTER
+                                   : MB_FC_WRITE_MULTIPLE_REGISTERS,
+        .reg_start  = addr,
+        .reg_size   = (uint16_t)count,
+    };
+    /* esp-modbus принимает не-const void*; const-cast безопасен — функция
+     * только читает буфер для FC 0x06/0x10. */
+    esp_err_t err = mbc_master_send_request(s_master_ctx, &req, (void *)data);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "write_holding slave=%d addr=0x%04X cnt=%u: %s",
+                 slave, addr, (unsigned)count, esp_err_to_name(err));
+    }
+    return err;
 }

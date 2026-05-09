@@ -318,6 +318,14 @@ const char *alarm_code_str(alarm_code_t code)
     case ALARM_PUMP_HP_OVERTEMP:   return "PUMP_HP_OVT";
     case ALARM_KWS_VOLTAGE_OOR:    return "KWS_V_OOR";
     case ALARM_KWS_OFFLINE:        return "KWS_OFFLINE";
+    case ALARM_DEV_CHECK_FAILED:   return "DEV_CHK_FAIL";
+    case ALARM_AI_BAD_MODE:        return "AI_BAD_MODE";
+    case ALARM_AI_WRONG_ADDR:      return "AI_WRONG_ADDR";
+    case ALARM_AI_VERSION_MISMATCH:return "AI_VER_MISMATCH";
+    case ALARM_AI_RANGE_OOR:       return "AI_RANGE_OOR";
+    case ALARM_SL21_RANGE_OOR:     return "SL21_RANGE_OOR";
+    case ALARM_URZH_RANGE_OOR:     return "URZH_RANGE_OOR";
+    case ALARM_KWS_RANGE_OOR:      return "KWS_RANGE_OOR";
     default:                    return "UNKNOWN";
     }
 }

@@ -26,6 +26,11 @@ typedef enum {
     CID_COND_ADDR11,        /* СЛ21 addr 11: holding regs 0x0001-0x0006 (X1+t1+X2+t2) */
     CID_KWS_PUMP_LP,        /* KWS-306L slave 20: holding regs 0x000E-0x001B (НД-насос) */
     CID_KWS_PUMP_HP,        /* KWS-306L slave 21: holding regs 0x000E-0x001B (ВД-насос) */
+    /* Health-check (mb_device_check.c): опрашиваются однократно через
+     * modbus_poller_read_holding/_write_holding, в s_poll_table[] не входят. */
+    CID_AI_MODES,           /* Waveshare AI: holding 0x1000..0x1007 (RW) — режимы каналов */
+    CID_AI_VERSION,         /* Waveshare AI: holding 0x8000 (R) — FW version */
+    CID_AI_DEV_ADDR,        /* Waveshare AI: holding 0x4000 (R) — device address */
     CID_COUNT
 } modbus_cid_t;
 
@@ -44,6 +49,11 @@ typedef enum {
  * Возможно, energy на самом деле uint32 в 0x001A+0x001B (тогда temperature
  * в другом регистре — нужен datasheet KWS-306L). */
 #define CID_KWS_REG_COUNT       14
+
+/* --- Health-check блоки (mb_device_check) --- */
+#define CID_AI_MODES_COUNT       8   /* 0x1000..0x1007: режимы 8 каналов AI */
+#define CID_AI_VERSION_COUNT     1   /* 0x8000: FW version (BCD V*100 + v) */
+#define CID_AI_DEV_ADDR_COUNT    1   /* 0x4000: device address (1..247) */
 
 /**
  * @brief Инициализация esp-modbus master и регистрация параметров
@@ -147,6 +157,43 @@ uint32_t modbus_poller_get_error_count(uint8_t slave_addr);
  * @return         фактическое количество записанных адресов
  */
 size_t modbus_poller_get_slave_addrs(uint8_t *out, size_t max_cnt);
+
+/**
+ * @brief Однократное чтение holding-регистров (FC 0x03) у произвольного slave.
+ *
+ * Используется health-check'ом (`mb_device_check.c`) для нерегулярных
+ * запросов вне циклического опроса (FW version, device addr, channel modes).
+ * Под капотом обращается к `mbc_master_send_request()` esp-modbus v2; стек
+ * сериализует доступ к шине, поэтому конкуренции с poll task'ом не возникает.
+ *
+ * @param slave  адрес устройства (1..247)
+ * @param addr   стартовый адрес регистра
+ * @param out    буфер ≥ count uint16_t (host-endian, БЕЗ word-swap)
+ * @param count  количество регистров (1..125)
+ * @retval ESP_OK              успех
+ * @retval ESP_ERR_INVALID_ARG out==NULL или count==0
+ * @retval ESP_ERR_INVALID_STATE стек ещё не инициализирован
+ * @retval ESP_ERR_TIMEOUT     не получен ответ за MB_RESPONSE_TIMEOUT_MS
+ * @retval ESP_FAIL            slave вернул exception или другая ошибка протокола
+ */
+esp_err_t modbus_poller_read_holding(uint8_t slave, uint16_t addr,
+                                     uint16_t *out, size_t count);
+
+/**
+ * @brief Однократная запись holding-регистров.
+ *
+ * При count==1 использует FC 0x06 (Write Single Register), иначе FC 0x10
+ * (Write Multiple Registers). Применяется для one-time setup устройств
+ * (например, перевод Waveshare AI в режим 4–20 mA).
+ *
+ * @param slave  адрес устройства
+ * @param addr   стартовый адрес
+ * @param data   буфер ≥ count uint16_t (host-endian)
+ * @param count  количество регистров (1..123 для FC 0x10)
+ * @retval ESP_OK / ESP_ERR_*  как у `modbus_poller_read_holding`.
+ */
+esp_err_t modbus_poller_write_holding(uint8_t slave, uint16_t addr,
+                                      const uint16_t *data, size_t count);
 
 #ifdef __cplusplus
 }

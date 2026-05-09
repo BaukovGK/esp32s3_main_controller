@@ -30,3 +30,49 @@ void mock_mb_set_kws_hp(const uint16_t *data, size_t count);
 void mock_mb_clear_first_poll(uint8_t slave_addr);
 
 void mock_mb_set_online(uint8_t slave_addr, bool online);
+
+/* === Health-check helpers (mb_device_check) === */
+
+/**
+ * @brief Задать буфер «отвечающих» holding-регистров для конкретного
+ *        slave/start_addr. modbus_poller_read_holding() с совпадающим
+ *        slave_addr возвращает скопированные значения, иначе — ESP_ERR_TIMEOUT.
+ *
+ * Если addr попадает в окно [base..base+count-1] — возвращается копия из
+ * буфера. Если не задано буфера — ESP_ERR_TIMEOUT.
+ */
+void mock_mb_set_holding(uint8_t slave_addr, uint16_t base_addr,
+                         const uint16_t *data, size_t count);
+
+/**
+ * @brief Полностью забыть отклики на read_holding (моделируется неответ).
+ */
+void mock_mb_clear_holding(void);
+
+/**
+ * @brief Получить число вызовов write_holding с момента последнего
+ *        mock_mb_clear_writes(). Используется для проверки что
+ *        автокоррекция действительно записала корректное значение.
+ */
+int mock_mb_get_write_count(void);
+
+/**
+ * @brief Получить параметры последнего write_holding вызова.
+ */
+void mock_mb_get_last_write(uint8_t *slave_out, uint16_t *addr_out,
+                            uint16_t *data_out, size_t *count_out,
+                            size_t data_max);
+
+/**
+ * @brief Сбросить счётчик write'ов и last-write буфер.
+ *        Также: после mock_mb_set_holding() запись через write_holding
+ *        автоматически обновит соответствующий read-буфер — это нужно для
+ *        теста «после автокоррекции повторное чтение возвращает 0x0003».
+ */
+void mock_mb_clear_writes(void);
+
+/**
+ * @brief Заставить следующий N-ный read_holding вернуть указанную ошибку.
+ *        Используется для тестирования путей восстановления.
+ */
+void mock_mb_set_read_error(esp_err_t err);

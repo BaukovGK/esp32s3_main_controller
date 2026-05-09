@@ -70,6 +70,18 @@ typedef enum {
                                          * value = измеренное напряжение */
     ALARM_KWS_OFFLINE        = 0x00C6,  /* нет связи с KWS slave 20 или 21;
                                          * value = адрес slave (20 или 21) */
+    /* Введены в Phase-5 (mb_device_check) — health check Modbus-устройств при старте.
+     * Это диагностические алармы (категория ALARM/INFO), не CRITICAL — установка
+     * продолжает работать, оператор должен проверить настройку прибора. */
+    ALARM_DEV_CHECK_FAILED   = 0x00D0,  /* health-check провалился (value = число неудачных устройств) */
+    ALARM_AI_BAD_MODE        = 0x00D1,  /* Waveshare AI: канал не в режиме 4–20мА после автокоррекции;
+                                         * value = номер канала (1..8) */
+    ALARM_AI_WRONG_ADDR      = 0x00D2,  /* Waveshare AI: device addr != expected; value = читаемый адрес */
+    ALARM_AI_VERSION_MISMATCH = 0x00D3, /* Waveshare AI: неожиданная FW version; value = raw register (V*100+v) */
+    ALARM_AI_RANGE_OOR       = 0x00D4,  /* Waveshare AI: канал вне sanity-диапазона (зарезервировано) */
+    ALARM_SL21_RANGE_OOR     = 0x00D5,  /* СЛ21: проводимость или температура вне ожидаемого диапазона */
+    ALARM_URZH_RANGE_OOR     = 0x00D6,  /* УРЖ2КМ: NaN/inf/огромный расход на старте */
+    ALARM_KWS_RANGE_OOR      = 0x00D7,  /* KWS: voltage/temperature вне sanity-диапазона */
 } alarm_code_t;
 
 /* Запись аварии */

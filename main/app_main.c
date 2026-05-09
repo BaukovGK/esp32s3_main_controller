@@ -25,6 +25,7 @@
 #include "hal_buzzer.h"
 #include "hal_rgb.h"
 #include "modbus_poller.h"
+#include "mb_device_check.h"
 #include "ethernet_init.h"
 
 #include "config_manager.h"
@@ -58,6 +59,12 @@ static const char *TAG = "app_main";
 
 /* Период задачи IO (debounce + E-STOP), мс */
 #define IO_TASK_CYCLE_MS    10
+
+/* Health-check: задержка перед запуском проверки (даём 2-3 цикла опроса
+ * шине стабилизироваться, чтобы snapshot'ы драйверов были заполнены). */
+#define HEALTH_CHECK_DELAY_MS  5000
+#define HEALTH_CHECK_STACK     4096
+#define HEALTH_CHECK_PRIO      (tskIDLE_PRIORITY + 1)
 
 /* --- Ethernet event handlers --- */
 
@@ -95,6 +102,20 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
     const esp_netif_ip_info_t *ip_info = &event->ip_info;
     ESP_LOGI(TAG, "Получен IP: " IPSTR ", маска: " IPSTR ", шлюз: " IPSTR,
              IP2STR(&ip_info->ip), IP2STR(&ip_info->netmask), IP2STR(&ip_info->gw));
+}
+
+/* --- Health-check task: одноразовый старт-ап аудит Modbus-устройств --- */
+static void health_check_task(void *arg)
+{
+    (void)arg;
+    /* Дать modbus_poller'у пройти 2-3 цикла опроса (минимальный период
+     * 100мс для AI, максимальный 3000мс для Cond) — за 5с все устройства
+     * должны успеть ответить хотя бы раз. До этого snapshot'ы драйверов
+     * NaN/zero, и КЖС-проверки бесполезны. */
+    vTaskDelay(pdMS_TO_TICKS(HEALTH_CHECK_DELAY_MS));
+    mb_device_check_run();
+    /* Самозавершение — это разовая операция при старте системы. */
+    vTaskDelete(NULL);
 }
 
 /* --- IoTask: debounce DI, логирование, watchdog feed --- */
@@ -274,6 +295,13 @@ void app_main(void)
     diagnostics_register_task("process", h);
     xTaskCreate(watchdog_task, "watchdog", TASK_WDT_STACK, NULL, TASK_WDT_PRIO, &h);
     diagnostics_register_task("watchdog", h);
+
+    /* 10.5. Health-check Modbus-устройств — одноразовая задача с задержкой
+     *       (см. mb_device_check.h). Запускается в фоне, чтобы не блокировать
+     *       app_main на 5 секунд. После выполнения сама себя удаляет. */
+    xTaskCreate(health_check_task, "hc", HEALTH_CHECK_STACK, NULL,
+                HEALTH_CHECK_PRIO, &h);
+    diagnostics_register_task("hc", h);
 
     /* 11. HTTP-сервер + REST API.
      * Phase-3 (M-7): soft-fail. Web — не-критичный компонент: при ошибке

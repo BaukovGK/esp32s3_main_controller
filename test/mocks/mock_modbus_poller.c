@@ -65,6 +65,13 @@ void mock_mb_reset(void)
     s_online_cond11 = true;
     s_online_kws_lp = true;
     s_online_kws_hp = true;
+
+    /* Сброс health-check моков (read/write holding) — реализованы ниже,
+     * объявления forward-declared для использования в reset. */
+    extern void mock_mb_clear_holding(void);
+    extern void mock_mb_clear_writes(void);
+    mock_mb_clear_holding();
+    mock_mb_clear_writes();
 }
 
 static void copy_clamped(uint16_t *dst, size_t dst_n, const uint16_t *src, size_t src_n)
@@ -269,6 +276,148 @@ uint32_t modbus_poller_get_error_count(uint8_t slave_addr)
     }
     if (!any_polled) return 0;
     return online_flag ? 0 : 999;
+}
+
+/* === Health-check stubs: read/write holding ===
+ *
+ * mock хранит до MOCK_HOLDING_MAX «прописанных» окон регистров. Каждое окно
+ * = (slave, base_addr, data[count]). modbus_poller_read_holding() ищет окно
+ * с совпадающим slave и addr ∈ [base..base+count-1], копирует подходящий
+ * срез. write_holding обновляет окно если оно есть, либо создаёт новое —
+ * это нужно для теста «после автокоррекции повторное чтение видит запись».
+ */
+#define MOCK_HOLDING_MAX 8
+#define MOCK_HOLDING_REGS 16
+
+typedef struct {
+    bool     used;
+    uint8_t  slave;
+    uint16_t base;
+    size_t   count;
+    uint16_t data[MOCK_HOLDING_REGS];
+} mock_holding_t;
+
+static mock_holding_t s_holdings[MOCK_HOLDING_MAX];
+static esp_err_t s_read_error = ESP_OK;
+
+static int s_write_count = 0;
+static uint8_t  s_last_write_slave = 0;
+static uint16_t s_last_write_addr  = 0;
+static uint16_t s_last_write_data[MOCK_HOLDING_REGS];
+static size_t   s_last_write_count = 0;
+
+void mock_mb_set_holding(uint8_t slave_addr, uint16_t base_addr,
+                         const uint16_t *data, size_t count)
+{
+    if (count > MOCK_HOLDING_REGS) count = MOCK_HOLDING_REGS;
+    /* Поиск существующего окна с тем же (slave, base) — обновляем in-place */
+    for (int i = 0; i < MOCK_HOLDING_MAX; i++) {
+        if (s_holdings[i].used &&
+            s_holdings[i].slave == slave_addr &&
+            s_holdings[i].base  == base_addr) {
+            s_holdings[i].count = count;
+            if (data) memcpy(s_holdings[i].data, data, count * sizeof(uint16_t));
+            else      memset(s_holdings[i].data, 0, count * sizeof(uint16_t));
+            return;
+        }
+    }
+    /* Иначе занять первый свободный слот */
+    for (int i = 0; i < MOCK_HOLDING_MAX; i++) {
+        if (!s_holdings[i].used) {
+            s_holdings[i].used  = true;
+            s_holdings[i].slave = slave_addr;
+            s_holdings[i].base  = base_addr;
+            s_holdings[i].count = count;
+            if (data) memcpy(s_holdings[i].data, data, count * sizeof(uint16_t));
+            else      memset(s_holdings[i].data, 0, count * sizeof(uint16_t));
+            return;
+        }
+    }
+}
+
+void mock_mb_clear_holding(void)
+{
+    memset(s_holdings, 0, sizeof(s_holdings));
+    s_read_error = ESP_OK;
+}
+
+void mock_mb_clear_writes(void)
+{
+    s_write_count = 0;
+    s_last_write_slave = 0;
+    s_last_write_addr  = 0;
+    s_last_write_count = 0;
+    memset(s_last_write_data, 0, sizeof(s_last_write_data));
+}
+
+int mock_mb_get_write_count(void)
+{
+    return s_write_count;
+}
+
+void mock_mb_get_last_write(uint8_t *slave_out, uint16_t *addr_out,
+                            uint16_t *data_out, size_t *count_out,
+                            size_t data_max)
+{
+    if (slave_out) *slave_out = s_last_write_slave;
+    if (addr_out)  *addr_out  = s_last_write_addr;
+    if (count_out) *count_out = s_last_write_count;
+    if (data_out) {
+        size_t n = (s_last_write_count < data_max) ? s_last_write_count : data_max;
+        memcpy(data_out, s_last_write_data, n * sizeof(uint16_t));
+    }
+}
+
+void mock_mb_set_read_error(esp_err_t err)
+{
+    s_read_error = err;
+}
+
+esp_err_t modbus_poller_read_holding(uint8_t slave, uint16_t addr,
+                                     uint16_t *out, size_t count)
+{
+    if (out == NULL || count == 0) return ESP_ERR_INVALID_ARG;
+    if (s_read_error != ESP_OK) return s_read_error;
+
+    for (int i = 0; i < MOCK_HOLDING_MAX; i++) {
+        if (!s_holdings[i].used)             continue;
+        if (s_holdings[i].slave != slave)    continue;
+        /* Запрашиваемый диапазон [addr..addr+count) должен лежать целиком в окне */
+        if (addr < s_holdings[i].base)       continue;
+        size_t offset = (size_t)(addr - s_holdings[i].base);
+        if (offset + count > s_holdings[i].count) continue;
+        memcpy(out, &s_holdings[i].data[offset], count * sizeof(uint16_t));
+        return ESP_OK;
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t modbus_poller_write_holding(uint8_t slave, uint16_t addr,
+                                      const uint16_t *data, size_t count)
+{
+    if (data == NULL || count == 0) return ESP_ERR_INVALID_ARG;
+    s_write_count++;
+    s_last_write_slave = slave;
+    s_last_write_addr  = addr;
+    size_t n = (count < MOCK_HOLDING_REGS) ? count : MOCK_HOLDING_REGS;
+    s_last_write_count = n;
+    memcpy(s_last_write_data, data, n * sizeof(uint16_t));
+
+    /* Обновить соответствующее окно read-буфера: после write_holding
+     * последующий read должен вернуть свежие значения (моделируем коммит
+     * настроек устройством). */
+    for (int i = 0; i < MOCK_HOLDING_MAX; i++) {
+        if (!s_holdings[i].used)             continue;
+        if (s_holdings[i].slave != slave)    continue;
+        if (addr < s_holdings[i].base)       continue;
+        size_t offset = (size_t)(addr - s_holdings[i].base);
+        if (offset + count > s_holdings[i].count) continue;
+        memcpy(&s_holdings[i].data[offset], data, count * sizeof(uint16_t));
+        return ESP_OK;
+    }
+    /* Окна нет — создаём, чтобы тесты могли вызвать write без предварительного set */
+    mock_mb_set_holding(slave, addr, data, count);
+    return ESP_OK;
 }
 
 size_t modbus_poller_get_slave_addrs(uint8_t *out, size_t max_cnt)
