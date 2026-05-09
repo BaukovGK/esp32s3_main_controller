@@ -28,13 +28,29 @@ static uint16_t s_ma_buf[AI_CHANNEL_COUNT][MA_WINDOW];
 static uint8_t  s_ma_idx;
 static bool     s_ma_filled;
 
-/* Порог обрыва: ~0.5% от 65535 → ток ниже ~4.08мА (обрыв провода) */
-#define FAULT_RAW_THRESHOLD  328
+/* Параметры 4-20мА токовой петли — Waveshare Modbus RTU Analog Input 8CH (A).
+ *
+ * В режиме 3 (4–20 мА) raw из input-регистра возвращается в МИКРОАМПЕРАХ
+ * напрямую (4 мА = 4000, 20 мА = 20000). Это подтверждено wiki производителя
+ * (раздел Software Test → Modbus Poll: «displays the current by default,
+ * and the unit is uA») и Arduino-демо doc/waveshare_ai_ref/.
+ *
+ * ⚠️ Этот код предполагает что модуль настроен в mode=3. По умолчанию
+ * jumper'ы замкнуты и mode=3, но если кто-то перевёл модуль в mode 4
+ * (scale code 0..4095) или mode 0/1 (вольтаж), формула даст неверный
+ * результат. См. analog_input_setup() в этом файле — TODO добавить
+ * one-time-setup через FC 0x10 на регистры 4x1000..4x1007. */
+#define UA_AT_4MA               4000    /* 4.0 мА = 4000 мкА */
+#define UA_AT_20MA              20000   /* 20.0 мА */
+#define UA_SPAN                 16000   /* (20 − 4) мА = 16000 мкА */
 
-/* Параметры 4-20мА токовой петли */
-#define ADC_RAW_MAX             65535.0f
-#define CURRENT_LOOP_MIN_MA     4.0f
-#define CURRENT_LOOP_SPAN_MA    16.0f   /* 20 - 4 мА */
+/* Sensor-fault детекция:
+ *   raw < FAULT_BREAK_UA (3.5 мА)  → обрыв токовой петли (нет 4 мА «живого нуля»)
+ *   raw > FAULT_SHORT_UA (20.5 мА) → короткое замыкание / переходный процесс
+ * Зона 3.5..4.0 мА и 20.0..20.5 мА — нормальный gracefulный диапазон датчика
+ * (производственный допуск ±0.1 мА × 5 = 0.5 мА), не считаем fault. */
+#define FAULT_BREAK_UA          3500
+#define FAULT_SHORT_UA          20500
 
 /* Количество активных каналов (P1..T) */
 #define AI_ENABLED_CHANNELS     5
@@ -100,22 +116,39 @@ void analog_input_update(void)
             continue;
         }
 
-        /* Среднее арифметическое */
+        /* Среднее арифметическое (raw в мкА) */
         uint32_t sum = 0;
         for (int j = 0; j < count; j++) {
             sum += s_ma_buf[ch][j];
         }
-        uint16_t avg = (uint16_t)(sum / count);
+        uint32_t avg_uA = sum / count;
 
-        /* Обрыв датчика */
-        snapshot.channels[ch].fault = (avg < FAULT_RAW_THRESHOLD);
+        /* Sensor fault: обрыв линии или КЗ */
+        bool fault_break = (avg_uA < FAULT_BREAK_UA);
+        bool fault_short = (avg_uA > FAULT_SHORT_UA);
+        snapshot.channels[ch].fault = fault_break || fault_short;
 
-        /* raw 0..ADC_RAW_MAX → range_min..range_max */
-        float ratio = (float)avg / ADC_RAW_MAX;
-        snapshot.channels[ch].value = s_config[ch].range_min +
-                                       ratio * (s_config[ch].range_max - s_config[ch].range_min);
-        snapshot.channels[ch].raw_ma = CURRENT_LOOP_MIN_MA + ratio * CURRENT_LOOP_SPAN_MA;
-        snapshot.channels[ch].valid = online && !snapshot.channels[ch].fault;
+        /* raw_mA для диагностики — всегда, даже при fault */
+        snapshot.channels[ch].raw_ma = (float)avg_uA / 1000.0f;
+
+        if (snapshot.channels[ch].fault) {
+            /* При fault не публикуем «реальное» давление — только NaN.
+             * Caller (state_machine, mqtt) должен трактовать это как
+             * sensor fault и не принимать решений по value. */
+            snapshot.channels[ch].value = NAN;
+            snapshot.channels[ch].valid = false;
+        } else {
+            /* (raw_uA − 4000) / 16000 → ratio в 0..1 для нормальной токовой петли.
+             * Клипуем на ±допуск (3.5..20.5 мА → ratio чуть меньше 0 или больше 1
+             * не считаем fault, но прижимаем к границам диапазона датчика). */
+            float ratio = ((float)avg_uA - (float)UA_AT_4MA) / (float)UA_SPAN;
+            if (ratio < 0.0f) ratio = 0.0f;
+            if (ratio > 1.0f) ratio = 1.0f;
+
+            float span = s_config[ch].range_max - s_config[ch].range_min;
+            snapshot.channels[ch].value = s_config[ch].range_min + ratio * span;
+            snapshot.channels[ch].valid = online;
+        }
     }
 
     portENTER_CRITICAL(&s_data_mux);

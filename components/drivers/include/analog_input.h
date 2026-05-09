@@ -1,9 +1,16 @@
 /**
  * @file analog_input.h
- * @brief Драйвер аналоговых входов Waveshare AI 8CH
+ * @brief Драйвер аналоговых входов Waveshare Modbus RTU Analog Input 8CH
  *
- * raw 0-65535 (4-20мА) → инженерные единицы (бар, °C).
- * Скользящее среднее N=8, детекция обрыва датчика.
+ * Источник: Development Protocol V2 (doc/wsh ai.txt) + Arduino-демо
+ * производителя (doc/waveshare_ai_ref/Modbus_RTU_Analog_Input.ino).
+ *
+ * Модуль настроен в режиме 3 (4–20 мА). Modbus возвращает raw в МИКРОАМПЕРАХ
+ * напрямую: 4 мА = 4000, 20 мА = 20000.
+ *
+ * Конверсия: ratio = (raw_uA − 4000) / 16000, value = min + ratio × (max − min).
+ * Sensor fault: raw < 3500 мкА → обрыв линии; raw > 20500 мкА → КЗ.
+ * Скользящее среднее N=8 для подавления шума.
  */
 #pragma once
 
