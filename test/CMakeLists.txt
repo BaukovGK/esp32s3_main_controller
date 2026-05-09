@@ -170,3 +170,9 @@ add_host_test(test_analog_input
     SRCS test_analog_input.c "${COMP_DIR}/drivers/analog_input.c"
     LIBS mocks_drivers
 )
+
+# 10. test_power_meter: real power_meter.c (KWS-306L) + mocks_drivers
+add_host_test(test_power_meter
+    SRCS test_power_meter.c "${COMP_DIR}/drivers/power_meter.c"
+    LIBS mocks_drivers
+)

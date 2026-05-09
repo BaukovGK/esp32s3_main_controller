@@ -21,21 +21,29 @@ extern "C" {
 typedef enum {
     CID_AI_CHANNELS = 0,    /* Waveshare AI: slave 1, input regs 0x0000-0x0007 */
     CID_FLOW_RATES,         /* УРЖ2КМ расход: slave 2, holding regs 0x0000-0x0007 */
-    CID_FLOW_VOLUMES,       /* УРЖ2КМ объём: slave 2, holding regs 0x0036-0x0045 */
+    CID_FLOW_VOLUMES,       /* УРЖ2КМ объём: slave 2, holding regs 0x0036-0x003D */
     CID_COND_ADDR10,        /* СЛ21 addr 10: holding regs 0x0001-0x0006 (X1+t1+X2+t2) */
     CID_COND_ADDR11,        /* СЛ21 addr 11: holding regs 0x0001-0x0006 (X1+t1+X2+t2) */
+    CID_KWS_PUMP_LP,        /* KWS-306L slave 20: holding regs 0x000E-0x001B (НД-насос) */
+    CID_KWS_PUMP_HP,        /* KWS-306L slave 21: holding regs 0x000E-0x001B (ВД-насос) */
     CID_COUNT
 } modbus_cid_t;
 
 /* --- Размеры буферов (в uint16_t регистрах) --- */
 #define CID_AI_REG_COUNT        8
 #define CID_FLOW_RATE_REG_COUNT 8
-#define CID_FLOW_VOL_REG_COUNT  16
+#define CID_FLOW_VOL_REG_COUNT  8   /* было 16; V5..V8 не сверены с протоколом ТЕСС, до сверки игнорируем */
 #define CID_COND10_REG_COUNT    6
 /* CID_COND11: расширено с 3 до 6 регистров (2026-05-09) — теперь читаем
  * обе ячейки X1/X2 и оба термодатчика t1/t2 второго блока СЛ21. Это
  * даёт 4-й логический канал проводимости COND_CH_CONC. */
 #define CID_COND11_REG_COUNT    6
+/* KWS-306L: 14 регистров одним блоком 0x000E..0x001B (U/I/P/E/Temp).
+ * Дырки между известными регистрами держим из-за неизвестных промежуточных
+ * значений — TODO опросить полный блок 0x0000..0x0040 при первом подключении.
+ * Возможно, energy на самом деле uint32 в 0x001A+0x001B (тогда temperature
+ * в другом регистре — нужен datasheet KWS-306L). */
+#define CID_KWS_REG_COUNT       14
 
 /**
  * @brief Инициализация esp-modbus master и регистрация параметров
@@ -90,6 +98,20 @@ esp_err_t modbus_poller_get_cond10_raw(uint16_t *out, size_t count);
  * @see modbus_poller_get_ai_raw для семантики ошибок.
  */
 esp_err_t modbus_poller_get_cond11_raw(uint16_t *out, size_t count);
+
+/**
+ * @brief Получить сырые регистры счётчика KWS-306L НД-насоса (slave 20)
+ *        Блок 14 регистров 0x000E..0x001B.
+ * @see modbus_poller_get_ai_raw для семантики ошибок.
+ */
+esp_err_t modbus_poller_get_kws_lp_raw(uint16_t *out, size_t count);
+
+/**
+ * @brief Получить сырые регистры счётчика KWS-306L ВД-насоса (slave 21)
+ *        Блок 14 регистров 0x000E..0x001B.
+ * @see modbus_poller_get_ai_raw для семантики ошибок.
+ */
+esp_err_t modbus_poller_get_kws_hp_raw(uint16_t *out, size_t count);
 
 /**
  * @brief Проверить доступность Modbus-устройства

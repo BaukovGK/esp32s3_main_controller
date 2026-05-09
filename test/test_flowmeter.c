@@ -43,9 +43,9 @@ void tearDown(void) {}
 void test_flow_zero(void)
 {
     uint16_t flow[8] = {0};
-    uint16_t vol[16] = {0};
+    uint16_t vol[8] = {0};
     mock_mb_set_flow(flow, 8);
-    mock_mb_set_volume(vol, 16);
+    mock_mb_set_volume(vol, 8);
 
     flowmeter_update();
 
@@ -63,9 +63,9 @@ void test_flow_word_swap_1_5(void)
         /* Q3 */ 0x0000, 0x0000,
         /* Q4 */ 0x0000, 0x0000,
     };
-    uint16_t vol[16] = {0};
+    uint16_t vol[8] = {0};
     mock_mb_set_flow(flow, 8);
-    mock_mb_set_volume(vol, 16);
+    mock_mb_set_volume(vol, 8);
 
     flowmeter_update();
 
@@ -82,12 +82,12 @@ void test_flow_word_swap_round_trip_all_channels(void)
         pack_float_word_swap(expected[ch], &flow[ch * 2], &flow[ch * 2 + 1]);
     }
     /* volume: тоже задаём, иначе channel_ok = false из-за NaN/inf проверки */
-    uint16_t vol[16] = {0};
+    uint16_t vol[8] = {0};
     for (int ch = 0; ch < 4; ch++) {
         pack_float_word_swap(0.0f, &vol[ch * 2], &vol[ch * 2 + 1]);
     }
     mock_mb_set_flow(flow, 8);
-    mock_mb_set_volume(vol, 16);
+    mock_mb_set_volume(vol, 8);
 
     flowmeter_update();
 
@@ -109,9 +109,9 @@ void test_flow_word_swap_wrong_order_detection(void)
         /* Q1 (НЕВЕРНЫЙ порядок) */ 0x3FC0, 0x0000,
         0,0, 0,0, 0,0,
     };
-    uint16_t vol[16] = {0};
+    uint16_t vol[8] = {0};
     mock_mb_set_flow(flow, 8);
-    mock_mb_set_volume(vol, 16);
+    mock_mb_set_volume(vol, 8);
 
     flowmeter_update();
 
@@ -126,11 +126,11 @@ void test_flow_word_swap_wrong_order_detection(void)
 void test_flow_negative_rejected(void)
 {
     uint16_t flow[8] = {0};
-    uint16_t vol[16] = {0};
+    uint16_t vol[8] = {0};
     pack_float_word_swap(-1.0f, &flow[0], &flow[1]);
     /* Остальные нули → ok */
     mock_mb_set_flow(flow, 8);
-    mock_mb_set_volume(vol, 16);
+    mock_mb_set_volume(vol, 8);
 
     flowmeter_update();
 
@@ -145,9 +145,9 @@ void test_flow_offline_device(void)
 {
     uint16_t flow[8] = {0};
     pack_float_word_swap(5.0f, &flow[0], &flow[1]);
-    uint16_t vol[16] = {0};
+    uint16_t vol[8] = {0};
     mock_mb_set_flow(flow, 8);
-    mock_mb_set_volume(vol, 16);
+    mock_mb_set_volume(vol, 8);
     mock_mb_set_online(MB_ADDR_URZH2KM, false);
 
     flowmeter_update();
@@ -162,9 +162,9 @@ void test_flow_nan_rejected(void)
         /* Q1: NaN */ 0xFFFF, 0x7FC0,
         0,0, 0,0, 0,0,
     };
-    uint16_t vol[16] = {0};
+    uint16_t vol[8] = {0};
     mock_mb_set_flow(flow, 8);
-    mock_mb_set_volume(vol, 16);
+    mock_mb_set_volume(vol, 8);
 
     flowmeter_update();
 

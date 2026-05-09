@@ -30,6 +30,7 @@ static const char *TAG = "mb_poller";
 #define MB_POLL_PERIOD_FLOW_MS    1000
 #define MB_POLL_PERIOD_VOL_MS     2000
 #define MB_POLL_PERIOD_COND_MS    3000
+#define MB_POLL_PERIOD_KWS_MS     2000  /* KWS-306L: U/I/P/E раз в 2 секунды */
 
 /* --- Прочие таймауты --- */
 #define MB_RESPONSE_TIMEOUT_MS    300   /* Phase-1: было 1000, для отзывчивости */
@@ -63,6 +64,8 @@ static uint16_t s_flow_data[CID_FLOW_RATE_REG_COUNT];
 static uint16_t s_volume_data[CID_FLOW_VOL_REG_COUNT];
 static uint16_t s_cond10_data[CID_COND10_REG_COUNT];
 static uint16_t s_cond11_data[CID_COND11_REG_COUNT];
+static uint16_t s_kws_lp_data[CID_KWS_REG_COUNT];
+static uint16_t s_kws_hp_data[CID_KWS_REG_COUNT];
 
 /* --- Таблица опроса (first_poll_done = false при старте) --- */
 static poll_entry_t s_poll_table[] = {
@@ -71,6 +74,8 @@ static poll_entry_t s_poll_table[] = {
     { CID_FLOW_VOLUMES,MB_ADDR_URZH2KM,     MB_POLL_PERIOD_VOL_MS,  0, CID_FLOW_VOL_REG_COUNT,  s_volume_data, 0, false },
     { CID_COND_ADDR10, MB_ADDR_SL21_201,    MB_POLL_PERIOD_COND_MS, 0, CID_COND10_REG_COUNT,    s_cond10_data, 0, false },
     { CID_COND_ADDR11, MB_ADDR_SL21_101,    MB_POLL_PERIOD_COND_MS, 0, CID_COND11_REG_COUNT,    s_cond11_data, 0, false },
+    { CID_KWS_PUMP_LP, MB_ADDR_KWS_PUMP_LP, MB_POLL_PERIOD_KWS_MS,  0, CID_KWS_REG_COUNT,       s_kws_lp_data, 0, false },
+    { CID_KWS_PUMP_HP, MB_ADDR_KWS_PUMP_HP, MB_POLL_PERIOD_KWS_MS,  0, CID_KWS_REG_COUNT,       s_kws_hp_data, 0, false },
 };
 #define POLL_TABLE_SIZE (sizeof(s_poll_table) / sizeof(s_poll_table[0]))
 
@@ -138,7 +143,7 @@ static const mb_parameter_descriptor_t s_device_params[] = {
         .param_opts     = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
         .access         = PAR_PERMS_READ
     },
-    /* CID_FLOW_VOLUMES: УРЖ2КМ объём, slave 2, holding regs 0x0036, 16 regs */
+    /* CID_FLOW_VOLUMES: УРЖ2КМ объём, slave 2, holding regs 0x0036, 8 regs (4 float-WS) */
     {
         .cid            = CID_FLOW_VOLUMES,
         .param_key      = "Vol",
@@ -181,6 +186,36 @@ static const mb_parameter_descriptor_t s_device_params[] = {
         .param_offset   = 0,
         .param_type     = PARAM_TYPE_ASCII,
         .param_size     = CID_COND11_REG_COUNT * 2,
+        .param_opts     = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
+        .access         = PAR_PERMS_READ
+    },
+    /* CID_KWS_PUMP_LP: KWS-306L slave 20 (НД-насос), holding regs 0x000E..0x001B (14 regs) */
+    {
+        .cid            = CID_KWS_PUMP_LP,
+        .param_key      = "KWS_LP",
+        .param_units    = "raw",
+        .mb_slave_addr  = MB_ADDR_KWS_PUMP_LP,
+        .mb_param_type  = MB_PARAM_HOLDING,
+        .mb_reg_start   = 0x000E,
+        .mb_size        = CID_KWS_REG_COUNT,
+        .param_offset   = 0,
+        .param_type     = PARAM_TYPE_ASCII,
+        .param_size     = CID_KWS_REG_COUNT * 2,
+        .param_opts     = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
+        .access         = PAR_PERMS_READ
+    },
+    /* CID_KWS_PUMP_HP: KWS-306L slave 21 (ВД-насос), holding regs 0x000E..0x001B (14 regs) */
+    {
+        .cid            = CID_KWS_PUMP_HP,
+        .param_key      = "KWS_HP",
+        .param_units    = "raw",
+        .mb_slave_addr  = MB_ADDR_KWS_PUMP_HP,
+        .mb_param_type  = MB_PARAM_HOLDING,
+        .mb_reg_start   = 0x000E,
+        .mb_size        = CID_KWS_REG_COUNT,
+        .param_offset   = 0,
+        .param_type     = PARAM_TYPE_ASCII,
+        .param_size     = CID_KWS_REG_COUNT * 2,
         .param_opts     = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
         .access         = PAR_PERMS_READ
     },
@@ -283,7 +318,9 @@ void modbus_poller_task(void *arg)
             }
 
             /* Временный буфер для чтения */
-            uint8_t temp_buf[CID_FLOW_VOL_REG_COUNT * 2]; /* максимальный размер */
+            /* Размер по самому крупному CID; KWS_REG_COUNT=14 сейчас максимум.
+             * Если добавить новый CID >14 регистров — увеличить здесь. */
+            uint8_t temp_buf[CID_KWS_REG_COUNT * 2]; /* максимальный размер */
             uint8_t param_type = 0;
 
             esp_err_t err = mbc_master_get_parameter(
@@ -410,6 +447,16 @@ esp_err_t modbus_poller_get_cond10_raw(uint16_t *out, size_t count)
 esp_err_t modbus_poller_get_cond11_raw(uint16_t *out, size_t count)
 {
     return get_raw_data_by_cid(CID_COND_ADDR11, out, count);
+}
+
+esp_err_t modbus_poller_get_kws_lp_raw(uint16_t *out, size_t count)
+{
+    return get_raw_data_by_cid(CID_KWS_PUMP_LP, out, count);
+}
+
+esp_err_t modbus_poller_get_kws_hp_raw(uint16_t *out, size_t count)
+{
+    return get_raw_data_by_cid(CID_KWS_PUMP_HP, out, count);
 }
 
 /* --- Статус устройств --- */

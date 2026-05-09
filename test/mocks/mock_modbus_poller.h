@@ -22,6 +22,8 @@ void mock_mb_set_flow(const uint16_t *data, size_t count);
 void mock_mb_set_volume(const uint16_t *data, size_t count);
 void mock_mb_set_cond10(const uint16_t *data, size_t count);
 void mock_mb_set_cond11(const uint16_t *data, size_t count);
+void mock_mb_set_kws_lp(const uint16_t *data, size_t count);
+void mock_mb_set_kws_hp(const uint16_t *data, size_t count);
 
 /* Сброс флага «первый опрос пройден» — для тестирования
  * H-modbus-initial-state path'а в драйверах. */
