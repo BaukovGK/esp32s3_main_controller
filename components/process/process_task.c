@@ -11,6 +11,7 @@
 #include "analog_input.h"
 #include "flowmeter.h"
 #include "conductivity.h"
+#include "power_meter.h"
 #include "state_machine.h"
 #include "doser.h"
 #include "telemetry.h"
@@ -139,6 +140,7 @@ void process_task(void *arg)
         analog_input_update();
         flowmeter_update();
         conductivity_update();
+        power_meter_update();  /* Phase-5: KWS-306L (НД/ВД) */
 
         /* 2. Обновление конечного автомата (вызывает interlocks_check внутри) */
         state_machine_update();
@@ -185,6 +187,21 @@ void process_task(void *arg)
                     alarm_clear(ALARM_MODBUS_OFFLINE);
                 }
                 s_mb_online_prev[i] = online;
+            }
+
+            /* Phase-5: отдельная защита потери связи с KWS-306L.
+             * Любой из двух offline → потеря защит насосов (NO_CURRENT/OVERTEMP/V_OOR
+             * не сработают, т.к. геттеры дают NaN при offline).
+             * value = адрес проблемного slave (20 / 21); если оба — раздельные алармы
+             * не дедуплицируются (общий код), value сохранит первый. */
+            bool lp_on = power_meter_is_online(PUMP_LP);
+            bool hp_on = power_meter_is_online(PUMP_HP);
+            if (!lp_on || !hp_on) {
+                float v = !lp_on ? (float)MB_ADDR_KWS_PUMP_LP
+                                 : (float)MB_ADDR_KWS_PUMP_HP;
+                alarm_raise(ALARM_KWS_OFFLINE, ALARM_CAT_WARNING, v);
+            } else {
+                alarm_clear(ALARM_KWS_OFFLINE);
             }
         }
 

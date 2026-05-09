@@ -44,6 +44,15 @@ static const plant_config_t s_defaults = {
         .username = "",
         .password = "",
     },
+    .kws = {
+        .current_min_A = 0.1f,
+        .current_check_delay_ms = 5000,
+        .temp_max_C = 80.0f,
+        .voltage_lp_min_V = 200.0f,
+        .voltage_lp_max_V = 250.0f,
+        .voltage_hp_min_V = 198.0f,
+        .voltage_hp_max_V = 242.0f,
+    },
 };
 
 /* === Реализация production API === */
@@ -64,6 +73,7 @@ void config_manager_get_pressure(config_pressure_t *out)     { *out = s_test_con
 void config_manager_get_doser(config_doser_t *out)           { *out = s_test_config.doser; }
 void config_manager_get_washing(config_washing_t *out)       { *out = s_test_config.washing; }
 void config_manager_get_timeouts(config_timeouts_t *out)     { *out = s_test_config.timeouts; }
+void config_manager_get_kws(config_kws_t *out)               { *out = s_test_config.kws; }
 
 esp_err_t config_manager_set_pressure(const config_pressure_t *cfg)
 {
@@ -98,6 +108,12 @@ esp_err_t config_manager_set_mqtt(const config_mqtt_t *cfg)
 esp_err_t config_manager_set_web_auth(const config_web_auth_t *cfg)
 {
     s_test_config.web_auth = *cfg;
+    return ESP_OK;
+}
+
+esp_err_t config_manager_set_kws(const config_kws_t *cfg)
+{
+    s_test_config.kws = *cfg;
     return ESP_OK;
 }
 

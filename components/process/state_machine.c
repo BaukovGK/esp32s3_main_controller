@@ -9,6 +9,7 @@
 #include "config_manager.h"
 #include "board_config.h"
 #include "analog_input.h"
+#include "power_meter.h"
 #include "alarm_manager.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -174,6 +175,93 @@ static bool check_pump_confirmation(uint8_t idx, bool pump_on, uint8_t di_pin)
 
 /* ===== Обработчики подсостояний ===== */
 
+/**
+ * @brief Phase-5: проверки на основе данных KWS-306L (НД/ВД насосы).
+ *
+ * Поднимает interlocks и алармы в трёх категориях:
+ *  1. NO_CURRENT — насос команд "ON", но KWS Я ниже current_min_A
+ *     (срабатывает только в AUTO_RUNNING после current_check_delay_ms).
+ *  2. OVERTEMP — KWS T > temp_max_C (всегда в AUTO).
+ *  3. VOLTAGE_OOR — KWS V вне допуска (всегда в AUTO).
+ *
+ * Данные с offline / valid=false → NaN от геттера → проверка пропускается
+ * (offline-аларм поднимается отдельно в process_task).
+ *
+ * @return  true — обнаружена аномалия, SM уже в FAULT (caller должен return);
+ *          false — всё OK, продолжить обработку substate.
+ */
+static bool check_kws_interlocks(void)
+{
+    config_kws_t kcfg;
+    config_manager_get_kws(&kcfg);
+
+    /* --- 1. NO_CURRENT: только в RUNNING, после задержки от старта насоса --- */
+    if (s_auto_sub == AUTO_RUNNING) {
+        int64_t since_step = esp_timer_get_time() - s_step_start_time;
+        int64_t delay_us   = (int64_t)kcfg.current_check_delay_ms * 1000LL;
+        if (since_step >= delay_us) {
+            /* НД (PUMP_LP, pump_feed) — проверяем только если SM хочет, чтобы насос был включён */
+            if (s_want_pump_feed) {
+                float i_lp = power_meter_get_current(PUMP_LP);
+                if (!isnan(i_lp) && i_lp < kcfg.current_min_A) {
+                    ESP_LOGE(TAG, "НД-насос: ток %.3f А < %.3f А (порог) — обмотка не включилась",
+                             i_lp, kcfg.current_min_A);
+                    alarm_raise(ALARM_PUMP_LP_NO_CURRENT, ALARM_CAT_CRITICAL, i_lp);
+                    enter_fault(INTERLOCK_PUMP_LP_NO_CURRENT);
+                    return true;
+                }
+            }
+            /* ВД (PUMP_HP, pump_stage2) — аналогично */
+            if (s_want_pump_stage2) {
+                float i_hp = power_meter_get_current(PUMP_HP);
+                if (!isnan(i_hp) && i_hp < kcfg.current_min_A) {
+                    ESP_LOGE(TAG, "ВД-насос: ток %.3f А < %.3f А (порог) — обмотка не включилась",
+                             i_hp, kcfg.current_min_A);
+                    alarm_raise(ALARM_PUMP_HP_NO_CURRENT, ALARM_CAT_CRITICAL, i_hp);
+                    enter_fault(INTERLOCK_PUMP_HP_NO_CURRENT);
+                    return true;
+                }
+            }
+        }
+    }
+
+    /* --- 2. OVERTEMP: всегда (даже на холостом, нагрев инерционен) --- */
+    float t_lp = power_meter_get_temperature(PUMP_LP);
+    if (!isnan(t_lp) && t_lp > kcfg.temp_max_C) {
+        ESP_LOGE(TAG, "НД-насос: перегрев %.1f°C > %.1f°C", t_lp, kcfg.temp_max_C);
+        alarm_raise(ALARM_PUMP_LP_OVERTEMP, ALARM_CAT_CRITICAL, t_lp);
+        enter_fault(INTERLOCK_PUMP_LP_OVERTEMP);
+        return true;
+    }
+    float t_hp = power_meter_get_temperature(PUMP_HP);
+    if (!isnan(t_hp) && t_hp > kcfg.temp_max_C) {
+        ESP_LOGE(TAG, "ВД-насос: перегрев %.1f°C > %.1f°C", t_hp, kcfg.temp_max_C);
+        alarm_raise(ALARM_PUMP_HP_OVERTEMP, ALARM_CAT_CRITICAL, t_hp);
+        enter_fault(INTERLOCK_PUMP_HP_OVERTEMP);
+        return true;
+    }
+
+    /* --- 3. VOLTAGE_OOR: проверяем напряжение питания НД/ВД --- */
+    float v_lp = power_meter_get_voltage(PUMP_LP);
+    if (!isnan(v_lp) && (v_lp < kcfg.voltage_lp_min_V || v_lp > kcfg.voltage_lp_max_V)) {
+        ESP_LOGE(TAG, "НД-насос: напряжение %.1f В вне [%.1f..%.1f] В",
+                 v_lp, kcfg.voltage_lp_min_V, kcfg.voltage_lp_max_V);
+        alarm_raise(ALARM_KWS_VOLTAGE_OOR, ALARM_CAT_ALARM, v_lp);
+        enter_fault(INTERLOCK_KWS_VOLTAGE_OOR);
+        return true;
+    }
+    float v_hp = power_meter_get_voltage(PUMP_HP);
+    if (!isnan(v_hp) && (v_hp < kcfg.voltage_hp_min_V || v_hp > kcfg.voltage_hp_max_V)) {
+        ESP_LOGE(TAG, "ВД-насос: напряжение %.1f В вне [%.1f..%.1f] В",
+                 v_hp, kcfg.voltage_hp_min_V, kcfg.voltage_hp_max_V);
+        alarm_raise(ALARM_KWS_VOLTAGE_OOR, ALARM_CAT_ALARM, v_hp);
+        enter_fault(INTERLOCK_KWS_VOLTAGE_OOR);
+        return true;
+    }
+
+    return false;
+}
+
 static void update_auto(const interlock_result_t *ilk)
 {
     config_timeouts_t tcfg;
@@ -199,6 +287,12 @@ static void update_auto(const interlock_result_t *ilk)
             enter_fault(INTERLOCK_STEP_TIMEOUT);
             return;
         }
+    }
+
+    /* Phase-5: KWS-306L защиты — проверяются на каждом цикле AUTO до dispatch'а
+     * substate. Если поднялся аларм — SM уже в FAULT, выходим. */
+    if (check_kws_interlocks()) {
+        return;
     }
 
     switch (s_auto_sub) {

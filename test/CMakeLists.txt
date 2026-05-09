@@ -61,6 +61,14 @@ target_include_directories(mock_interlocks_lib PUBLIC
     ${COMPONENT_INCLUDES}
 )
 
+# Phase-5: mock_power_meter — отдельно, т.к. конфликтует с реальным power_meter.c
+# (test_power_meter линкует настоящий драйвер через mocks_drivers).
+add_library(mock_power_meter_lib STATIC mocks/mock_power_meter.c)
+target_include_directories(mock_power_meter_lib PUBLIC
+    ${STUB_INCLUDES}
+    ${COMPONENT_INCLUDES}
+)
+
 # Phase-3 (L-5): минимальный набор моков для тестирования настоящих драйверов
 # (без мок-замен driver-уровня; вместо этого мокируется modbus_poller).
 add_library(mocks_drivers STATIC
@@ -127,10 +135,10 @@ add_host_test(test_doser
     LIBS mocks_core mock_config
 )
 
-# 3. test_state_machine: real state_machine.c + alarm_manager.c + mocks_core + mock_config + mock_interlocks
+# 3. test_state_machine: real state_machine.c + alarm_manager.c + mocks_core + mock_config + mock_interlocks + mock_power_meter (Phase-5)
 add_host_test(test_state_machine
     SRCS test_state_machine.c "${COMP_DIR}/process/state_machine.c" "${COMP_DIR}/services/alarm_manager.c"
-    LIBS mocks_core mock_config mock_interlocks_lib
+    LIBS mocks_core mock_config mock_interlocks_lib mock_power_meter_lib
 )
 
 # 4. test_alarm_manager: real alarm_manager.c + mocks_core

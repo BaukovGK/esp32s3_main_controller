@@ -8,6 +8,11 @@
  *  - Превышение давления (P1, P3, P4)
  *  - Перегрев (T > overshoot)
  *  - Засорение фильтра (P1-P2 > порога)
+ *  - KWS-306L (Phase-5, биты 17..21):
+ *      * NO_CURRENT  — насос команд "ON", но KWS Я ниже current_min_A
+ *                     (катушка не тянет, обрыв обмотки, стартер не сработал)
+ *      * OVERTEMP    — KWS T > config_kws_t.temp_max_C (перегрев двигателя)
+ *      * VOLTAGE_OOR — KWS V вне допустимого диапазона (НД 1ф / ВД 3ф фазное)
  */
 #pragma once
 
@@ -46,6 +51,16 @@ extern "C" {
  * alarm ALARM_STEP_TIMEOUT. */
 #define INTERLOCK_STEP_TIMEOUT      (1 << 16)
 
+/* Phase-5 (KWS-306L integration): биты на основе данных от счётчиков
+ * KWS-306L (slaves 20/21). Поднимаются из state_machine.update_auto, когда
+ * драйвер power_meter сообщает аномалию: НД-насос не тянет ток, перегрев
+ * корпуса, питающее напряжение вне допуска. */
+#define INTERLOCK_PUMP_LP_NO_CURRENT  (1U << 17)  /* НД-насос: SM в RUNNING, но KWS Я=0 → обмотка не включилась */
+#define INTERLOCK_PUMP_HP_NO_CURRENT  (1U << 18)  /* ВД-насос: то же */
+#define INTERLOCK_PUMP_LP_OVERTEMP    (1U << 19)  /* НД-насос: KWS T > порога (default 80°C) */
+#define INTERLOCK_PUMP_HP_OVERTEMP    (1U << 20)  /* ВД-насос: то же */
+#define INTERLOCK_KWS_VOLTAGE_OOR     (1U << 21)  /* KWS V вне допуска для соответствующей фазы */
+
 /* Phase-4: маска всех известных бит fault_flags. Используется при восстановлении
  * из NVS для отбрасывания «мусорных» бит, если NVS повреждена. ОБНОВЛЯТЬ при
  * добавлении новых INTERLOCK_* выше. */
@@ -66,7 +81,12 @@ extern "C" {
     INTERLOCK_SENSOR_FAULT_P4   | \
     INTERLOCK_SENSOR_FAULT_T    | \
     INTERLOCK_UNEXPECTED_RESTART| \
-    INTERLOCK_STEP_TIMEOUT)
+    INTERLOCK_STEP_TIMEOUT      | \
+    INTERLOCK_PUMP_LP_NO_CURRENT| \
+    INTERLOCK_PUMP_HP_NO_CURRENT| \
+    INTERLOCK_PUMP_LP_OVERTEMP  | \
+    INTERLOCK_PUMP_HP_OVERTEMP  | \
+    INTERLOCK_KWS_VOLTAGE_OOR)
 
 typedef struct {
     uint32_t active_flags;      /* Битовая маска активных блокировок */

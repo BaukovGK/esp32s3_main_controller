@@ -61,6 +61,19 @@ typedef struct {
     char password[32];
 } config_web_auth_t;
 
+/* Phase-5: пороги защиты на основе данных KWS-306L.
+ * Используются state_machine.update_auto для генерации интерлоков
+ * NO_CURRENT / OVERTEMP / VOLTAGE_OOR. */
+typedef struct {
+    float    current_min_A;          /* default 0.1 — порог «насос работает» (А, ниже = нет тока) */
+    int32_t  current_check_delay_ms; /* default 5000 — выждать после старта насоса перед проверкой тока */
+    float    temp_max_C;             /* default 80.0 — макс. допустимая T корпуса двигателя (°C) */
+    float    voltage_lp_min_V;       /* default 200.0 — мин. напряжение НД (1ф) */
+    float    voltage_lp_max_V;       /* default 250.0 — макс. напряжение НД (1ф) */
+    float    voltage_hp_min_V;       /* default 198.0 — ВД (3ф фазное, 380V/√3 = 219.4 ± 10%) */
+    float    voltage_hp_max_V;       /* default 242.0 */
+} config_kws_t;
+
 typedef struct {
     config_pressure_t pressure;
     config_doser_t    doser;
@@ -68,6 +81,7 @@ typedef struct {
     config_timeouts_t timeouts;
     config_mqtt_t     mqtt;
     config_web_auth_t web_auth;  /* Phase-4 */
+    config_kws_t      kws;       /* Phase-5 (KWS-306L integration) */
 } plant_config_t;
 
 /**
@@ -99,6 +113,7 @@ void config_manager_get_pressure(config_pressure_t *out);
 void config_manager_get_doser(config_doser_t *out);
 void config_manager_get_washing(config_washing_t *out);
 void config_manager_get_timeouts(config_timeouts_t *out);
+void config_manager_get_kws(config_kws_t *out);  /* Phase-5 */
 
 esp_err_t config_manager_set_pressure(const config_pressure_t *cfg);
 esp_err_t config_manager_set_doser(const config_doser_t *cfg);
@@ -106,6 +121,7 @@ esp_err_t config_manager_set_washing(const config_washing_t *cfg);
 esp_err_t config_manager_set_timeouts(const config_timeouts_t *cfg);
 esp_err_t config_manager_set_mqtt(const config_mqtt_t *cfg);
 esp_err_t config_manager_set_web_auth(const config_web_auth_t *cfg);
+esp_err_t config_manager_set_kws(const config_kws_t *cfg);  /* Phase-5 */
 
 #ifdef __cplusplus
 }

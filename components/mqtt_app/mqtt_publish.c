@@ -13,6 +13,7 @@
 #include "analog_input.h"
 #include "flowmeter.h"
 #include "conductivity.h"
+#include "power_meter.h"
 #include "hal_gpio.h"
 #include "alarm_manager.h"
 #include "diagnostics.h"
@@ -118,6 +119,32 @@ void mqtt_publish_full_status(esp_mqtt_client_handle_t client)
         snprintf(buf, sizeof(buf), "{\"conductivity\":%s,\"temperature\":%s,\"ok\":%s}",
                  cbuf, tbuf, cd.channel_ok[i] ? "true" : "false");
         snprintf(topic, sizeof(topic), "ro_plant/status/conductivity/%s", cond_names[i]);
+        esp_mqtt_client_publish(client, topic, buf, 0, 0, 0);
+    }
+
+    /* 5a. Power meter (KWS-306L) — добавлено 2026-05-09 */
+    static const char *pump_names[] = {"lp", "hp"};
+    _Static_assert(sizeof(pump_names) / sizeof(pump_names[0]) == PUMP_COUNT,
+                   "pump_names must have PUMP_COUNT entries");
+
+    for (int i = 0; i < PUMP_COUNT; i++) {
+        power_meter_data_t pm;
+        power_meter_get_data((pump_id_t)i, &pm);
+
+        char vbuf[16], abuf[16], wbuf[16], ebuf[16], tbuf[16];
+        /* При valid=false (offline или до первого опроса) → null в JSON */
+        fmt_float(vbuf, sizeof(vbuf), pm.valid ? pm.voltage_V     : NAN);
+        fmt_float(abuf, sizeof(abuf), pm.valid ? pm.current_A     : NAN);
+        fmt_float(wbuf, sizeof(wbuf), pm.valid ? pm.power_W       : NAN);
+        fmt_float(ebuf, sizeof(ebuf), pm.valid ? pm.energy_kWh    : NAN);
+        fmt_float(tbuf, sizeof(tbuf), pm.valid ? pm.temperature_C : NAN);
+
+        snprintf(buf, sizeof(buf),
+                 "{\"voltage\":%s,\"current\":%s,\"power\":%s,"
+                 "\"energy\":%s,\"temperature\":%s,\"online\":%s}",
+                 vbuf, abuf, wbuf, ebuf, tbuf,
+                 pm.online ? "true" : "false");
+        snprintf(topic, sizeof(topic), "ro_plant/status/power/%s", pump_names[i]);
         esp_mqtt_client_publish(client, topic, buf, 0, 0, 0);
     }
 
@@ -275,6 +302,30 @@ static const ha_entity_t s_ha_entities[] = {
      "{{ value_json.conductivity }}", "\xC2\xB5S/cm", NULL, "mdi:flash", "sensor"},
     {"ro_plant_s4", "RO Concentrate Conductivity", "ro_plant/status/conductivity/s4",
      "{{ value_json.conductivity }}", "\xC2\xB5S/cm", NULL, "mdi:flash", "sensor"},
+
+    /* Счётчики электроэнергии KWS-306L (добавлено 2026-05-09) */
+    /* НД-насос (PUMP_LP, slave 20) — 5 сенсоров */
+    {"ro_plant_lp_voltage", "RO LP Pump Voltage", "ro_plant/status/power/lp",
+     "{{ value_json.voltage }}", "V", "voltage", "mdi:flash", "sensor"},
+    {"ro_plant_lp_current", "RO LP Pump Current", "ro_plant/status/power/lp",
+     "{{ value_json.current }}", "A", "current", "mdi:current-ac", "sensor"},
+    {"ro_plant_lp_power", "RO LP Pump Power", "ro_plant/status/power/lp",
+     "{{ value_json.power }}", "W", "power", "mdi:lightning-bolt", "sensor"},
+    {"ro_plant_lp_energy", "RO LP Pump Energy", "ro_plant/status/power/lp",
+     "{{ value_json.energy }}", "kWh", "energy", "mdi:counter", "sensor"},
+    {"ro_plant_lp_temperature", "RO LP Pump Temperature", "ro_plant/status/power/lp",
+     "{{ value_json.temperature }}", "\xC2\xB0" "C", "temperature", "mdi:thermometer", "sensor"},
+    /* ВД-насос (PUMP_HP, slave 21) — 5 сенсоров */
+    {"ro_plant_hp_voltage", "RO HP Pump Voltage", "ro_plant/status/power/hp",
+     "{{ value_json.voltage }}", "V", "voltage", "mdi:flash", "sensor"},
+    {"ro_plant_hp_current", "RO HP Pump Current", "ro_plant/status/power/hp",
+     "{{ value_json.current }}", "A", "current", "mdi:current-ac", "sensor"},
+    {"ro_plant_hp_power", "RO HP Pump Power", "ro_plant/status/power/hp",
+     "{{ value_json.power }}", "W", "power", "mdi:lightning-bolt", "sensor"},
+    {"ro_plant_hp_energy", "RO HP Pump Energy", "ro_plant/status/power/hp",
+     "{{ value_json.energy }}", "kWh", "energy", "mdi:counter", "sensor"},
+    {"ro_plant_hp_temperature", "RO HP Pump Temperature", "ro_plant/status/power/hp",
+     "{{ value_json.temperature }}", "\xC2\xB0" "C", "temperature", "mdi:thermometer", "sensor"},
 
     /* Телеметрия */
     {"ro_plant_filter_dp", "RO Filter dP", "ro_plant/status/telemetry",

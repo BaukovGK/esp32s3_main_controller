@@ -16,6 +16,7 @@
 #include "mock_analog_input.h"
 #include "mock_interlocks.h"
 #include "mock_hal_nvs.h"
+#include "mock_power_meter.h"
 #include "analog_input.h"
 #include "alarm_manager.h"
 
@@ -27,6 +28,7 @@ void setUp(void)
     mock_config_set_defaults();
     mock_analog_reset();
     mock_interlocks_reset();
+    mock_pm_reset();  /* Phase-5: KWS оба offline по умолчанию (геттеры NaN) */
 
     /* alarm_manager нужен для state_machine (MANUAL dep warnings) */
     alarm_manager_init();

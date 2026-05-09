@@ -144,8 +144,12 @@ static esp_err_t status_get_handler(httpd_req_t *req)
         cJSON_AddItemToArray(j_flow, ch);
     }
 
-    /* Кондуктометры */
-    static const char *cond_names[] = {"\xCF\x83" "1", "\xCF\x83" "2", "\xCF\x83" "3"};
+    /* Кондуктометры (4 канала с 2026-05-09 — добавлен σ4=концентрат) */
+    static const char *cond_names[] = {
+        "\xCF\x83" "1", "\xCF\x83" "2", "\xCF\x83" "3", "\xCF\x83" "4"
+    };
+    _Static_assert(sizeof(cond_names) / sizeof(cond_names[0]) == COND_CHANNEL_COUNT,
+                   "cond_names must have COND_CHANNEL_COUNT entries");
     conductivity_data_t cd;
     conductivity_get_data(&cd);
 

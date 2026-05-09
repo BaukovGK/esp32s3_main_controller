@@ -186,6 +186,44 @@
 
 ---
 
+### 2.5a Счётчики электроэнергии KWS-306L (добавлено 2026-05-09)
+
+**Топик:** `ro_plant/status/power/{NAME}`
+где `{NAME}` = `lp` (НД-насос, slave 20) либо `hp` (ВД-насос, slave 21)
+
+QoS 0, без Retain. Период публикации совпадает с прочими статусными топиками (каждый цикл `mqtt_publish_full_status`, ~1 с).
+
+```json
+{
+  "voltage": 230.5,
+  "current": 4.21,
+  "power": 970.5,
+  "energy": 12.34,
+  "temperature": 38.0,
+  "online": true
+}
+```
+
+| Канал | Топик | Slave | Описание |
+|-------|-------|-------|----------|
+| `lp` | `ro_plant/status/power/lp` | 20 | НД-насос (PUMP_LP) |
+| `hp` | `ro_plant/status/power/hp` | 21 | ВД-насос (PUMP_HP) |
+
+Поля:
+
+| Поле | Тип | Единицы | Описание |
+|------|-----|---------|----------|
+| `voltage` | float\|null | В | Напряжение (raw 0x000E × 0.1) |
+| `current` | float\|null | А | Ток (raw 0x0010 × 0.001) |
+| `power` | float\|null | Вт | Активная мощность (raw 0x0012 × 0.1) |
+| `energy` | float\|null | кВт·ч | Накопленная энергия (raw 0x001A × 0.01) |
+| `temperature` | float\|null | °C | Температура корпуса (raw 0x001B × 1) |
+| `online` | bool | — | Устройство отвечает на Modbus-шине |
+
+> Все числовые поля становятся `null` при `valid=false` (offline или до первого опроса) — потребитель не должен принять `0.0` за валидное измерение.
+
+---
+
 ### 2.6 Телеметрия (расчётные параметры)
 
 **Топик:** `ro_plant/status/telemetry`
@@ -321,6 +359,8 @@
 
 Размер массивов `modbus.online` / `modbus.errors` в JSON равен фактическому числу slave-адресов; при добавлении новых устройств в `modbus_poller` они автоматически попадают в этот список.
 
+> Публикация значений KWS-306L в `ro_plant/status/power/{lp,hp}` реализована — см. §2.5a.
+
 ---
 
 ### 2.11 Availability
@@ -442,7 +482,7 @@
 
 ## 4. Home Assistant MQTT Discovery
 
-При подключении к брокеру контроллер автоматически публикует конфигурации для **22 entities** в Home Assistant.
+При подключении к брокеру контроллер автоматически публикует конфигурации для **33 entities** в Home Assistant (с 2026-05-09 добавлены `ro_plant_s4` и 10 сенсоров KWS-306L: V/A/W/kWh/°C для каждого из двух насосов).
 
 **Формат топика Discovery:**
 `homeassistant/{type}/ro_plant/{object_id}/config`
@@ -465,6 +505,17 @@
 | `ro_plant_s1` | RO Feed Conductivity | `.../status/conductivity/s1` | µS/cm |
 | `ro_plant_s2` | RO Perm1 Conductivity | `.../status/conductivity/s2` | µS/cm |
 | `ro_plant_s3` | RO Perm2 Conductivity | `.../status/conductivity/s3` | µS/cm |
+| `ro_plant_s4` | RO Concentrate Conductivity | `.../status/conductivity/s4` | µS/cm |
+| `ro_plant_lp_voltage` | RO LP Pump Voltage | `.../status/power/lp` | V |
+| `ro_plant_lp_current` | RO LP Pump Current | `.../status/power/lp` | A |
+| `ro_plant_lp_power` | RO LP Pump Power | `.../status/power/lp` | W |
+| `ro_plant_lp_energy` | RO LP Pump Energy | `.../status/power/lp` | kWh |
+| `ro_plant_lp_temperature` | RO LP Pump Temperature | `.../status/power/lp` | °C |
+| `ro_plant_hp_voltage` | RO HP Pump Voltage | `.../status/power/hp` | V |
+| `ro_plant_hp_current` | RO HP Pump Current | `.../status/power/hp` | A |
+| `ro_plant_hp_power` | RO HP Pump Power | `.../status/power/hp` | W |
+| `ro_plant_hp_energy` | RO HP Pump Energy | `.../status/power/hp` | kWh |
+| `ro_plant_hp_temperature` | RO HP Pump Temperature | `.../status/power/hp` | °C |
 | `ro_plant_filter_dp` | RO Filter dP | `.../status/telemetry` | bar |
 | `ro_plant_recovery` | RO System Recovery | `.../status/telemetry` | % |
 | `ro_plant_sel1` | RO Stage1 Selectivity | `.../status/telemetry` | % |
@@ -517,6 +568,9 @@ ro_plant/
 │   │   ├── s2                      → {conductivity, temperature, ok}  (Perm1)
 │   │   ├── s3                      → {conductivity, temperature, ok}  (Perm2)
 │   │   └── s4                      → {conductivity, temperature, ok}  (Conc)
+│   ├── power/
+│   │   ├── lp                      → {voltage, current, power, energy, temperature, online}  (KWS slave 20)
+│   │   └── hp                      → {voltage, current, power, energy, temperature, online}  (KWS slave 21)
 │   ├── telemetry                   → {filter_dp, stage1_feed, recovery2, recovery_sys, sel1, sel2}
 │   ├── doser                       → {state, enabled}
 │   ├── interlocks                  → {flags, estop, filter_warn}

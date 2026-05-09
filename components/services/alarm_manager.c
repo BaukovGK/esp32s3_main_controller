@@ -312,6 +312,12 @@ const char *alarm_code_str(alarm_code_t code)
     case ALARM_RESTART_DURING_OP: return "RST_DURING_OP";
     case ALARM_STEP_TIMEOUT:    return "STEP_TIMEOUT";
     case ALARM_LOW_HEAP:        return "LOW_HEAP";
+    case ALARM_PUMP_LP_NO_CURRENT: return "PUMP_LP_NO_I";
+    case ALARM_PUMP_HP_NO_CURRENT: return "PUMP_HP_NO_I";
+    case ALARM_PUMP_LP_OVERTEMP:   return "PUMP_LP_OVT";
+    case ALARM_PUMP_HP_OVERTEMP:   return "PUMP_HP_OVT";
+    case ALARM_KWS_VOLTAGE_OOR:    return "KWS_V_OOR";
+    case ALARM_KWS_OFFLINE:        return "KWS_OFFLINE";
     default:                    return "UNKNOWN";
     }
 }

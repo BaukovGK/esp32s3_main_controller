@@ -31,6 +31,7 @@
 #include "analog_input.h"
 #include "flowmeter.h"
 #include "conductivity.h"
+#include "power_meter.h"
 #include "interlocks.h"
 #include "state_machine.h"
 #include "doser.h"
@@ -235,6 +236,7 @@ void app_main(void)
     analog_input_init();
     flowmeter_init();
     conductivity_init();
+    power_meter_init();  /* Phase-5: KWS-306L (НД/ВД) */
 
     /* 9. Менеджер аварий — должен быть до state_machine_init,
      *    т.к. SM может поднять ALARM_RESTART_DURING_OP при восстановлении. */

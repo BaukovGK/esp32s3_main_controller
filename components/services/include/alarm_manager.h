@@ -61,6 +61,15 @@ typedef enum {
                                          * value = (float)auto_substate_t. */
     /* Введены в Phase-3 (зрелость) */
     ALARM_LOW_HEAP           = 0x00C0,  /* free heap < threshold; value = свободные байты */
+    /* Введены в Phase-5 (KWS-306L integration) */
+    ALARM_PUMP_LP_NO_CURRENT = 0x00C1,  /* НД: отсутствует ток при RUNNING; value = текущий ток (А) */
+    ALARM_PUMP_HP_NO_CURRENT = 0x00C2,  /* ВД: отсутствует ток при RUNNING; value = текущий ток (А) */
+    ALARM_PUMP_LP_OVERTEMP   = 0x00C3,  /* НД: перегрев двигателя; value = температура (°C) */
+    ALARM_PUMP_HP_OVERTEMP   = 0x00C4,  /* ВД: перегрев двигателя; value = температура (°C) */
+    ALARM_KWS_VOLTAGE_OOR    = 0x00C5,  /* KWS V вне допуска (1ф НД 200..250 В, 3ф ВД фазное 198..242 В);
+                                         * value = измеренное напряжение */
+    ALARM_KWS_OFFLINE        = 0x00C6,  /* нет связи с KWS slave 20 или 21;
+                                         * value = адрес slave (20 или 21) */
 } alarm_code_t;
 
 /* Запись аварии */
