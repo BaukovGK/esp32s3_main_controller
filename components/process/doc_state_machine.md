@@ -26,6 +26,7 @@
 | `"state_machine.h"` | Собственный публичный заголовок |
 | `"interlocks.h"` | Система блокировок безопасности |
 | `"hal_gpio.h"` | HAL-уровень дискретных входов/выходов (`hal_gpio_read_di`, `hal_gpio_write_do`, `hal_gpio_write_do_pin`) |
+| `"hal_nvs.h"` | **Phase-2 (K-4)**: persistence SM-state и fault_flags в NVS |
 | `"config_manager.h"` | Доступ к конфигурации установки (`plant_config_t`) |
 | `"board_config.h"` | Константы распиновки платы (номера DI/DO) |
 | `"analog_input.h"` | Чтение аналоговых входов (температура для промывки) |
@@ -33,8 +34,85 @@
 | `"esp_log.h"` | Логирование ESP-IDF |
 | `"esp_timer.h"` | Таймер высокого разрешения (`esp_timer_get_time()`) |
 | `"freertos/FreeRTOS.h"` | Спинлоки (`portMUX_TYPE`, `portENTER_CRITICAL`) |
+| `<stdatomic.h>` | **Phase-4 (C-2)**: атомарные операции для `s_wash_confirm_pending` |
 | `<string.h>` | `memset` |
 | `<math.h>` | `isnan` |
+
+---
+
+## Phase-2 (K-4): Persistence SM-state в NVS
+
+При каждом переходе между состояниями (через `set_state()`) и при каждом подъёме `enter_fault()` функция `persist_sm_state()` записывает в NVS два ключа:
+
+| NVS-ключ | Тип | Содержимое |
+|---|---|---|
+| `sm_state` | `int32` | Текущее `sm_state_t` (0=IDLE, 1=AUTO, 2=WASHING, 3=MANUAL, 4=FAULT) |
+| `sm_fault` | `int32` | Битовая маска `s_fault_flags` (комбинация `INTERLOCK_*`) |
+
+При старте `state_machine_init()` читает эти ключи и принимает решение:
+
+| Сохранённое состояние | Поведение init |
+|---|---|
+| `SM_FAULT` | Восстанавливаем FAULT с теми же flags. Оператор должен сделать `CMD_RESET_FAULT`. |
+| `SM_AUTO` или `SM_WASHING` | **Считаем перезагрузку аварийной** (panic / WDT / brownout). Входим в FAULT с `INTERLOCK_UNEXPECTED_RESTART` + поднимаем `ALARM_RESTART_DURING_OP`. Слепо продолжать работу нельзя — фактическое состояние агрегатов после рестарта неизвестно. |
+| `SM_IDLE` / `SM_MANUAL` / отсутствует / повреждено | Чистый старт с `SM_IDLE`, fault_flags=0. |
+
+**До Phase-2** `state_machine_init()` всегда стартовал с IDLE — после watchdog-restart во время WASHING причина FAULT терялась, оператор не видел истории, а опасные сценарии (рестарт с горячим ТЭНом) обрабатывались только аппаратными интерлоками.
+
+---
+
+## Phase-4 (C-2): Атомарность `s_wash_confirm_pending`
+
+Флаг подтверждения фазы промывки оператором пишется не из ProcessTask (httpd-обработчик `/api/v1/wash/confirm` или MQTT-подписчик вызывают `state_machine_send_command(CMD_CONFIRM_WASH_PHASE)`, после чего в `state_machine_update` под спинлоком команда читается и **затем без синхронизации** устанавливался `s_wash_confirm_pending = true`). Чтение в `update_washing` тоже было без синхронизации:
+
+```c
+bool confirmed = s_wash_confirm_pending;  // race
+s_wash_confirm_pending = false;            // race
+```
+
+Хотя `bool`/`uint8` атомарен на ESP32-S3 при выровненном доступе, формально это data race (UB по C11). Заменено на `_Atomic bool` + `atomic_store`/`atomic_exchange`. `atomic_exchange` гарантирует, что флаг, выставленный между чтением и сбросом, не теряется.
+
+---
+
+## Phase-4 (C-3): Валидация SM-state из NVS
+
+В Phase-2 при восстановлении из NVS значения `int32_t` напрямую приводились к `sm_state_t` и `uint32_t fault_flags`. Если NVS повреждена (износ flash, прерванная запись, чужие данные), это давало:
+
+- Невалидное `sm_state_t` (например, 99) → UB при последующих сравнениях.
+- Биты `fault_flags` вне известной маски → оператор видит «фейковые» аварии.
+
+Теперь:
+
+1. Проверяется диапазон `saved_state ∈ [SM_IDLE, SM_FAULT]`.
+2. `saved_flags` маскируется по `INTERLOCK_KNOWN_MASK` (см. `interlocks.h`); если есть «лишние» биты вне маски — данные считаются повреждёнными.
+3. При невалидных данных: чистый старт с `SM_IDLE`, `fault_flags=0`, поднимается `ALARM_UNEXPECTED_RESTART` (категория ALARM, value = saved_state как float).
+
+`INTERLOCK_KNOWN_MASK` нужно обновлять при добавлении новых `INTERLOCK_*` бит.
+
+---
+
+## Phase-4 (H-step-timeout): Таймаут шага AUTO
+
+Подсостояния `AUTO_STARTING_PUMP1`, `AUTO_STARTING_PUMP2`, `AUTO_FILLING_INTERM`, `AUTO_STARTING_PUMP3` ждут внешних событий: подтверждение DI насоса или появление уровня в промбаке. Если событие не приходит из-за неисправности (отказ датчика, обрыв проводки, заклинивший насос, завоздушивание линии), SM раньше зависал в подсостоянии без таймаута — оставались включёнными насосы, не было перехода в FAULT.
+
+Теперь в начале `update_auto` проверяется `elapsed >= step_timeout_s` (значение из `config.timeouts.step_timeout_s`, по умолч. 60 с). При превышении:
+
+- Поднимается `ALARM_STEP_TIMEOUT` (код `0x00B2`, категория ALARM, value = текущий `auto_substate_t`).
+- Вызывается `enter_fault(INTERLOCK_STEP_TIMEOUT)` — все выходы выключаются, переход в `SM_FAULT`.
+
+Исключения: `AUTO_RAMP` имеет собственный таймер (`pump_ramp_ms`), `AUTO_RUNNING` — рабочее подсостояние (не транзитное), `AUTO_STOPPING` — мгновенное.
+
+Для подтверждений насосов отдельно работает `check_pump_confirmation` с таймаутом `pump_confirm_ms` (короче — обычно 3 с): он более специфичен и фолтует `ALARM_PUMP{1,2,3}_TIMEOUT`. `step_timeout_s` — общая верхняя граница.
+
+---
+
+## Phase-3 (L-1): Защита от повреждённого enum
+
+Во всех `switch`-конструкциях SM (`update_auto`, `update_washing`, главный switch по `s_state`) добавлены `default:` ветки. При повреждении памяти (космические лучи, EMI, переполнение стека) переменные enum могут принять невалидное значение — без default-ветки поведение undefined. Теперь:
+
+- `update_auto`: невалидный `auto_sub` → `ESP_LOGE` + `enter_fault(0)`.
+- `update_washing`: невалидный `wash_sub` → `ESP_LOGE` + `enter_fault(0)`.
+- Главный switch `s_state`: невалидное `state` → safe state (DO=0) + принудительный `s_state = SM_FAULT` + persist в NVS.
 
 ---
 
@@ -119,7 +197,7 @@
 | `s_manual_do_mask` | `uint8_t` | Битовая маска DO для ручного режима. Бит 0 = RO1, бит 1 = RO2 и т.д. |
 | `s_step_start_time` | `int64_t` | Временная метка (в микросекундах, `esp_timer_get_time`) входа в текущее подсостояние. Используется для отсчёта таймаутов. |
 | `s_pump_start_us[3]` | `int64_t[3]` | Временные метки включения каждого из трёх насосов для проверки таймаута подтверждения. Индекс 0 = pump_feed, 1 = pump_stage1, 2 = pump_stage2. Значение 0 означает, что таймер не запущен. |
-| `s_wash_confirm_pending` | `bool` | Флаг ожидающего подтверждения фазы промывки от оператора. Устанавливается при получении `CMD_CONFIRM_WASH_PHASE`, сбрасывается на каждом цикле `update_washing`. |
+| `s_wash_confirm_pending` | `_Atomic bool` | Флаг ожидающего подтверждения фазы промывки от оператора. Устанавливается через `atomic_store` при получении `CMD_CONFIRM_WASH_PHASE` (Phase-4 C-2 — был обычным `bool`), читается и сбрасывается через `atomic_exchange` в `update_washing`. |
 
 ---
 

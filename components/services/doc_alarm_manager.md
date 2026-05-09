@@ -77,6 +77,13 @@
 | `ALARM_FAULT_RESET`       | 0x0081    | `"FAULT_RST"`    | Выполнен сброс аварии оператором                     |
 | `ALARM_MANUAL_DEP_WARN`   | 0x0082    | `"MANUAL_DEP"`   | Ручной режим: нарушение зависимости агрегатов        |
 | `ALARM_SYSTEM_START`      | 0x0090    | `"SYS_START"`    | Система запущена (стартовое событие)                  |
+| `ALARM_DO_READBACK_FAIL`  | 0x00A0    | `"DO_READBACK"`  | **Phase-1**: реальное состояние TCA9554 != ожидаемому (потеря контроля над выходами) |
+| `ALARM_I2C_BUS_HUNG`      | 0x00A1    | `"I2C_HUNG"`     | **Phase-1**: таймаут захвата мьютекса шины I2C (>200мс) — шина заклинила |
+| `ALARM_MB_DATA_LOCK_HUNG` | 0x00A2    | `"MB_LOCK_HUNG"` | **Phase-1**: таймаут мьютекса данных Modbus poller (>100мс) |
+| `ALARM_UNEXPECTED_RESTART`| 0x00B0    | `"UNEXP_RST"`    | **Phase-2**: предыдущая перезагрузка не от POWERON/SW (panic, WDT, brownout). value = `esp_reset_reason_t`. **Phase-4 (C-3)**: также при невалидном восстановлении SM-state из NVS (повреждённое state или маска fault_flags) |
+| `ALARM_RESTART_DURING_OP` | 0x00B1    | `"RST_DURING_OP"`| **Phase-2**: перезагрузка во время AUTO/WASHING. Система входит в FAULT с `INTERLOCK_UNEXPECTED_RESTART`, требуется CMD_RESET_FAULT |
+| `ALARM_STEP_TIMEOUT`      | 0x00B2    | `"STEP_TIMEOUT"` | **Phase-4 (H-step-timeout)**: подсостояние AUTO (STARTING_PUMP1/2/3, FILLING_INTERM) не завершилось за `timeouts.step_timeout_s`. Система входит в FAULT с `INTERLOCK_STEP_TIMEOUT`. value = `auto_substate_t` |
+| `ALARM_LOW_HEAP`          | 0x00C0    | `"LOW_HEAP"`     | **Phase-3 (M-3)**: free heap < 16 КБ. Снимается при > 20 КБ (гистерезис). value = свободные байты |
 
 **Группировка кодов по диапазонам:**
 - `0x0001-0x000F` -- Дискретные аварии (E-STOP, уровни баков)
@@ -89,6 +96,9 @@
 - `0x0070-0x007F` -- Связь Modbus
 - `0x0080-0x008F` -- Состояния и сброс
 - `0x0090-0x009F` -- Системные события
+- `0x00A0-0x00AF` -- Аварии HAL/шины (Phase-1)
+- `0x00B0-0x00BF` -- Системная история / перезагрузки (Phase-2)
+- `0x00C0-0x00CF` -- Ресурсы (heap, stack) (Phase-3)
 
 ---
 
@@ -129,6 +139,9 @@ typedef void (*alarm_notify_cb_t)(const alarm_entry_t *entry);
 | `s_cb_count`     | `int`                            | Число зарегистрированных callback-функций                             |
 | `s_next_id`      | `uint32_t`                       | Следующий порядковый номер записи (загружается из NVS при старте)      |
 | `s_save_counter` | `uint32_t`                       | Счетчик аварий с момента последнего сохранения ID в NVS               |
+| `s_lock`         | `SemaphoreHandle_t`              | **Phase-1**: mutex защиты всех публичных API (раньше синхронизации не было — гонки между process_task / mqtt_task / httpd) |
+
+**Phase-1 (потокобезопасность):** все функции (`alarm_raise`, `alarm_clear`, `alarm_get_active`, `alarm_get_history`, `alarm_manager_register_notify`) захватывают `s_lock` с таймаутом `LOCK_TIMEOUT_MS = 100` мс. При истечении таймаута событие отбрасывается и логируется ошибка. Callbacks вызываются **вне** lock'а с локальным снимком массива указателей — это предотвращает deadlock, если callback повторно обращается к API. NVS-запись `alm_id` тоже выполняется вне lock'а (NVS-операции медленные, ~10 мс на flash erase).
 
 ---
 
@@ -147,28 +160,14 @@ static void history_push(const alarm_entry_t *entry)
 
 ---
 
-### `notify_all`
+### `lock_take` / `lock_give` (Phase-1)
 
 ```c
-static void notify_all(const alarm_entry_t *entry)
+static inline bool lock_take(void);
+static inline void lock_give(void);
 ```
 
-**Описание:** Вызывает все зарегистрированные callback-функции, передавая им указатель на запись аварии. Проверяет каждый callback на `NULL` перед вызовом.
-
-**Параметры:**
-- `entry` -- указатель на запись аварии
-
----
-
-### `save_id_to_nvs`
-
-```c
-static void save_id_to_nvs(void)
-```
-
-**Описание:** Сохраняет текущее значение счетчика `s_next_id` в NVS по ключу `"alm_id"`. Вызывается периодически (каждые `NVS_SAVE_INTERVAL` аварий) или немедленно при критической аварии. Это обеспечивает непрерывную нумерацию аварий после перезагрузки устройства.
-
-**Параметры:** нет
+**Описание:** Захват/освобождение mutex'а `s_lock` с таймаутом `LOCK_TIMEOUT_MS`. При вызове до `alarm_manager_init()` (когда `s_lock == NULL`) `lock_take` возвращает `true` без захвата — это позволяет первому `alarm_raise(ALARM_SYSTEM_START, ...)` из `alarm_manager_init` отработать корректно.
 
 ---
 

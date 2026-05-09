@@ -50,6 +50,13 @@
 | `INTERLOCK_PUMP1_TIMEOUT` | `(1 << 8)` = `0x0100` | Таймаут подтверждения насоса подачи (DI6 не появился в течение `pump_confirm_ms`). Используется в `state_machine.c`, а не в `interlocks.c`. |
 | `INTERLOCK_PUMP2_TIMEOUT` | `(1 << 9)` = `0x0200` | Таймаут подтверждения насоса 1-й ступени (DI7). Аналогично. |
 | `INTERLOCK_PUMP3_TIMEOUT` | `(1 << 10)` = `0x0400` | Таймаут подтверждения насоса 2-й ступени (DI8). Аналогично. |
+| `INTERLOCK_SENSOR_FAULT_P1` | `(1 << 11)` = `0x0800` | **Phase-1**: датчик P1 неисправен (NaN от `analog_input` — обрыв 4–20 мА (raw < 3500 мкА), КЗ (raw > 20500 мкА) или offline Modbus). Блокирует: `pump_feed`. |
+| `INTERLOCK_SENSOR_FAULT_P3` | `(1 << 12)` = `0x1000` | **Phase-1**: датчик P3 неисправен. Блокирует: `pump_stage1`. |
+| `INTERLOCK_SENSOR_FAULT_P4` | `(1 << 13)` = `0x2000` | **Phase-1**: датчик P4 неисправен. Блокирует: `pump_stage2`. |
+| `INTERLOCK_SENSOR_FAULT_T` | `(1 << 14)` = `0x4000` | **Phase-1**: датчик температуры неисправен. Блокирует: `heater`. |
+| `INTERLOCK_UNEXPECTED_RESTART` | `(1 << 15)` = `0x8000` | **Phase-2**: после неожиданной перезагрузки (panic / WDT / brownout) во время AUTO или WASHING. Поднимается `state_machine_init()`. Снимается только `CMD_RESET_FAULT` от оператора — система отказывается слепо продолжать работу с неизвестным состоянием агрегатов. |
+| `INTERLOCK_STEP_TIMEOUT` | `(1 << 16)` = `0x10000` | **Phase-4 (H-step-timeout)**: подсостояние AUTO (STARTING_PUMP1/2/3, FILLING_INTERM) не завершилось за `config.timeouts.step_timeout_s`. Поднимается из `update_auto`, сопровождается `ALARM_STEP_TIMEOUT`. |
+| `INTERLOCK_KNOWN_MASK`   | OR всех бит выше | **Phase-4 (C-3)**: маска для валидации `fault_flags` при восстановлении из NVS. «Лишние» биты вне маски трактуются как повреждение NVS — данные отбрасываются, поднимается `ALARM_UNEXPECTED_RESTART`. |
 
 ---
 
@@ -143,12 +150,24 @@ void interlocks_check(bool manual_mode, interlock_result_t *result);
 
 5. **Проверка давлений (аналоговые входы):**
    - Чтение P1, P2, P3, P4 через `analog_input_get_value()`.
-   - Все проверки пропускают NaN (неисправный датчик не вызывает ложной блокировки).
-   - **P1 > p1_max:** флаг `INTERLOCK_P1_HIGH`, запрет `allow_pump_feed`.
-   - **P3 > p3_max:** флаг `INTERLOCK_P3_HIGH`, запрет `allow_pump_stage1`.
-   - **P4 > p4_max:** флаг `INTERLOCK_P4_HIGH`, запрет `allow_pump_stage2`.
+   - **Phase-1 (отказоустойчивость):** NaN теперь трактуется как **отказ датчика** и блокирует
+     соответствующий агрегат (без блокировки система продолжала бы работать без верхней защиты по давлению).
+     NaN возвращается из `analog_input` при любом из условий неисправности 4–20 мА:
+     - **обрыв линии:** `raw < FAULT_BREAK_UA` (3500 мкА, ~3.5 мА);
+     - **короткое замыкание:** `raw > FAULT_SHORT_UA` (20500 мкА, ~20.5 мА);
+     - **offline Modbus** (slave не отвечает).
+
+     Действия:
+     - `isnan(P1)`: флаг `INTERLOCK_SENSOR_FAULT_P1`, запрет `allow_pump_feed`.
+     - `isnan(P3)`: флаг `INTERLOCK_SENSOR_FAULT_P3`, запрет `allow_pump_stage1`.
+     - `isnan(P4)`: флаг `INTERLOCK_SENSOR_FAULT_P4`, запрет `allow_pump_stage2`.
+   - При валидном значении проверяется превышение порога:
+     - **P1 > p1_max:** флаг `INTERLOCK_P1_HIGH`, запрет `allow_pump_feed`.
+     - **P3 > p3_max:** флаг `INTERLOCK_P3_HIGH`, запрет `allow_pump_stage1`.
+     - **P4 > p4_max:** флаг `INTERLOCK_P4_HIGH`, запрет `allow_pump_stage2`.
 
 6. **Проверка температуры:**
+   - **isnan(T):** флаг `INTERLOCK_SENSOR_FAULT_T`, запрет `allow_heater` (Phase-1; включает обрыв, КЗ и offline Modbus — те же условия, что и для датчиков давления).
    - **T > t_overshoot_C:** флаг `INTERLOCK_T_HIGH`, запрет `allow_heater`.
 
 7. **Проверка перепада давления на фильтре:**
@@ -172,6 +191,10 @@ void interlocks_check(bool manual_mode, interlock_result_t *result);
 | P4 > p4_max | - | - | БЛОК | - | - |
 | T > t_overshoot | - | - | - | БЛОК | - |
 | dP фильтра > порога | - | - | - | - | - |
+| **isnan(P1)** *(Phase-1)* | **БЛОК** | - | - | - | - |
+| **isnan(P3)** *(Phase-1)* | - | **БЛОК** | - | - | - |
+| **isnan(P4)** *(Phase-1)* | - | - | **БЛОК** | - | - |
+| **isnan(T)** *(Phase-1)* | - | - | - | **БЛОК** | - |
 
 **Примечание:** В ручном режиме (`manual_mode = true`) действует **только** E-STOP. Все остальные проверки пропускаются.
 

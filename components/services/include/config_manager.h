@@ -20,6 +20,8 @@ typedef struct {
 typedef struct {
     int32_t run_time_min;   /* Время работы дозатора, мин (по умолч. 5) */
     int32_t cycle_time_min; /* Период цикла дозатора, мин (по умолч. 60) */
+    /* TODO: для дозирования во время WASHING понадобятся отдельные
+     * wash_run_time_min / wash_cycle_time_min — см. README. */
 } config_doser_t;
 
 typedef struct {
@@ -35,6 +37,11 @@ typedef struct {
 typedef struct {
     int32_t pump_confirm_ms;  /* Таймаут подтверждения насоса, мс (по умолч. 3000) */
     int32_t pump_ramp_ms;     /* Время разгона УПП, мс (по умолч. 15000) */
+    /* Phase-4 (H-step-timeout): максимальное время пребывания в подсостоянии
+     * AUTO (STARTING_PUMP1/2/3, FILLING_INTERM), после которого SM фолтуется
+     * с ALARM_STEP_TIMEOUT. Защита от «зависания» процесса при отсутствии
+     * ожидаемого события (давление, поток, уровень) из-за неисправности. */
+    int32_t step_timeout_s;   /* Таймаут шага AUTO, сек (по умолч. 60) */
 } config_timeouts_t;
 
 typedef struct {
@@ -46,12 +53,35 @@ typedef struct {
     int32_t enabled;              /* 0 = отключён, 1 = включён */
 } config_mqtt_t;
 
+/* Phase-4 (H-13): опциональная HTTP Basic Auth для web-интерфейса.
+ * Логика: пустой username = auth выключен (по умолчанию).
+ * При непустом username web-сервер требует заголовок Authorization. */
+typedef struct {
+    char username[32];   /* пусто = auth выключен */
+    char password[32];
+} config_web_auth_t;
+
+/* Phase-5: пороги защиты на основе данных KWS-306L.
+ * Используются state_machine.update_auto для генерации интерлоков
+ * NO_CURRENT / OVERTEMP / VOLTAGE_OOR. */
+typedef struct {
+    float    current_min_A;          /* default 0.1 — порог «насос работает» (А, ниже = нет тока) */
+    int32_t  current_check_delay_ms; /* default 5000 — выждать после старта насоса перед проверкой тока */
+    float    temp_max_C;             /* default 80.0 — макс. допустимая T корпуса двигателя (°C) */
+    float    voltage_lp_min_V;       /* default 200.0 — мин. напряжение НД (1ф) */
+    float    voltage_lp_max_V;       /* default 250.0 — макс. напряжение НД (1ф) */
+    float    voltage_hp_min_V;       /* default 198.0 — ВД (3ф фазное, 380V/√3 = 219.4 ± 10%) */
+    float    voltage_hp_max_V;       /* default 242.0 */
+} config_kws_t;
+
 typedef struct {
     config_pressure_t pressure;
     config_doser_t    doser;
     config_washing_t  washing;
     config_timeouts_t timeouts;
     config_mqtt_t     mqtt;
+    config_web_auth_t web_auth;  /* Phase-4 */
+    config_kws_t      kws;       /* Phase-5 (KWS-306L integration) */
 } plant_config_t;
 
 /**
@@ -70,11 +100,28 @@ const plant_config_t *config_manager_get(void);
  */
 void config_manager_get_copy(plant_config_t *out);
 
+/**
+ * @brief Phase-2 (H-1): атомарные снимки отдельных секций.
+ *
+ * Используются на горячих путях (interlocks_check, state_machine_update,
+ * doser_update), где раньше через config_manager_get() читались несколько
+ * полей подряд. Между чтениями setter мог обновить структуру под спинлоком
+ * → reader видел смешанные «старые/новые» поля. Per-section copy защищает
+ * от этого, копируя секцию атомарно (память < 64 байт под spinlock'ом).
+ */
+void config_manager_get_pressure(config_pressure_t *out);
+void config_manager_get_doser(config_doser_t *out);
+void config_manager_get_washing(config_washing_t *out);
+void config_manager_get_timeouts(config_timeouts_t *out);
+void config_manager_get_kws(config_kws_t *out);  /* Phase-5 */
+
 esp_err_t config_manager_set_pressure(const config_pressure_t *cfg);
 esp_err_t config_manager_set_doser(const config_doser_t *cfg);
 esp_err_t config_manager_set_washing(const config_washing_t *cfg);
 esp_err_t config_manager_set_timeouts(const config_timeouts_t *cfg);
 esp_err_t config_manager_set_mqtt(const config_mqtt_t *cfg);
+esp_err_t config_manager_set_web_auth(const config_web_auth_t *cfg);
+esp_err_t config_manager_set_kws(const config_kws_t *cfg);  /* Phase-5 */
 
 #ifdef __cplusplus
 }

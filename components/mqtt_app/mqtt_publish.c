@@ -13,6 +13,7 @@
 #include "analog_input.h"
 #include "flowmeter.h"
 #include "conductivity.h"
+#include "power_meter.h"
 #include "hal_gpio.h"
 #include "alarm_manager.h"
 #include "diagnostics.h"
@@ -72,7 +73,11 @@ void mqtt_publish_full_status(esp_mqtt_client_handle_t client)
 
     for (int i = 0; i < 5; i++) {
         char vbuf[16];
-        fmt_float(vbuf, sizeof(vbuf), ai.channels[i].value);
+        /* Phase-5 (H-modbus-initial-state): до первого опроса valid=false →
+         * публикуем null вместо нулевого значения, чтобы потребитель не
+         * принял 0.0 за валидное измерение. */
+        float v = ai.channels[i].valid ? ai.channels[i].value : NAN;
+        fmt_float(vbuf, sizeof(vbuf), v);
         snprintf(buf, sizeof(buf), "{\"value\":%s,\"unit\":\"%s\",\"fault\":%s}",
                  vbuf, ai_units[i], ai.channels[i].fault ? "true" : "false");
         snprintf(topic, sizeof(topic), "ro_plant/status/analog/%s", ai_names[i]);
@@ -86,26 +91,60 @@ void mqtt_publish_full_status(esp_mqtt_client_handle_t client)
 
     for (int i = 0; i < FLOW_CHANNEL_COUNT; i++) {
         char fbuf[16], vbuf[16];
-        fmt_float(fbuf, sizeof(fbuf), fm.flow_m3h[i]);
-        fmt_float(vbuf, sizeof(vbuf), fm.volume_m3[i]);
+        /* Phase-5: channel_ok=false → null вместо 0.0 */
+        float fv = fm.channel_ok[i] ? fm.flow_m3h[i]  : NAN;
+        float vv = fm.channel_ok[i] ? fm.volume_m3[i] : NAN;
+        fmt_float(fbuf, sizeof(fbuf), fv);
+        fmt_float(vbuf, sizeof(vbuf), vv);
         snprintf(buf, sizeof(buf), "{\"flow\":%s,\"volume\":%s,\"ok\":%s}",
                  fbuf, vbuf, fm.channel_ok[i] ? "true" : "false");
         snprintf(topic, sizeof(topic), "ro_plant/status/flow/%s", flow_names[i]);
         esp_mqtt_client_publish(client, topic, buf, 0, 0, 0);
     }
 
-    /* 5. Conductivity */
-    static const char *cond_names[] = {"s1", "s2", "s3"};
+    /* 5. Conductivity (4 канала с 2026-05-09 — добавлен s4=концентрат) */
+    static const char *cond_names[] = {"s1", "s2", "s3", "s4"};
+    _Static_assert(sizeof(cond_names) / sizeof(cond_names[0]) == COND_CHANNEL_COUNT,
+                   "cond_names must have COND_CHANNEL_COUNT entries");
     conductivity_data_t cd;
     conductivity_get_data(&cd);
 
     for (int i = 0; i < COND_CHANNEL_COUNT; i++) {
         char cbuf[16], tbuf[16];
-        fmt_float(cbuf, sizeof(cbuf), cd.conductivity_uS[i]);
-        fmt_float(tbuf, sizeof(tbuf), cd.temperature_C[i]);
+        /* Phase-5: channel_ok=false → null вместо 0.0 */
+        float cv = cd.channel_ok[i] ? cd.conductivity_uS[i] : NAN;
+        float tv = cd.channel_ok[i] ? cd.temperature_C[i]   : NAN;
+        fmt_float(cbuf, sizeof(cbuf), cv);
+        fmt_float(tbuf, sizeof(tbuf), tv);
         snprintf(buf, sizeof(buf), "{\"conductivity\":%s,\"temperature\":%s,\"ok\":%s}",
                  cbuf, tbuf, cd.channel_ok[i] ? "true" : "false");
         snprintf(topic, sizeof(topic), "ro_plant/status/conductivity/%s", cond_names[i]);
+        esp_mqtt_client_publish(client, topic, buf, 0, 0, 0);
+    }
+
+    /* 5a. Power meter (KWS-306L) — добавлено 2026-05-09 */
+    static const char *pump_names[] = {"lp", "hp"};
+    _Static_assert(sizeof(pump_names) / sizeof(pump_names[0]) == PUMP_COUNT,
+                   "pump_names must have PUMP_COUNT entries");
+
+    for (int i = 0; i < PUMP_COUNT; i++) {
+        power_meter_data_t pm;
+        power_meter_get_data((pump_id_t)i, &pm);
+
+        char vbuf[16], abuf[16], wbuf[16], ebuf[16], tbuf[16];
+        /* При valid=false (offline или до первого опроса) → null в JSON */
+        fmt_float(vbuf, sizeof(vbuf), pm.valid ? pm.voltage_V     : NAN);
+        fmt_float(abuf, sizeof(abuf), pm.valid ? pm.current_A     : NAN);
+        fmt_float(wbuf, sizeof(wbuf), pm.valid ? pm.power_W       : NAN);
+        fmt_float(ebuf, sizeof(ebuf), pm.valid ? pm.energy_kWh    : NAN);
+        fmt_float(tbuf, sizeof(tbuf), pm.valid ? pm.temperature_C : NAN);
+
+        snprintf(buf, sizeof(buf),
+                 "{\"voltage\":%s,\"current\":%s,\"power\":%s,"
+                 "\"energy\":%s,\"temperature\":%s,\"online\":%s}",
+                 vbuf, abuf, wbuf, ebuf, tbuf,
+                 pm.online ? "true" : "false");
+        snprintf(topic, sizeof(topic), "ro_plant/status/power/%s", pump_names[i]);
         esp_mqtt_client_publish(client, topic, buf, 0, 0, 0);
     }
 
@@ -192,20 +231,17 @@ void mqtt_publish_diagnostics(esp_mqtt_client_handle_t client)
     }
     if (pos < cap) pos += snprintf(buf + pos, sizeof(buf) - pos, "},");
 
-    /* Modbus */
-    if (pos < cap) {
+    /* Modbus. Phase-4 (M-6): список устройств динамический. */
+    if (pos < cap) pos += snprintf(buf + pos, sizeof(buf) - pos, "\"modbus\":[");
+    for (size_t i = 0; i < diag.mb_count && pos < cap; i++) {
         pos += snprintf(buf + pos, sizeof(buf) - pos,
-                        "\"modbus\":{\"errors\":[%lu,%lu,%lu,%lu],"
-                        "\"online\":[%s,%s,%s,%s]},",
-                        (unsigned long)diag.mb_errors[0],
-                        (unsigned long)diag.mb_errors[1],
-                        (unsigned long)diag.mb_errors[2],
-                        (unsigned long)diag.mb_errors[3],
-                        diag.mb_online[0] ? "true" : "false",
-                        diag.mb_online[1] ? "true" : "false",
-                        diag.mb_online[2] ? "true" : "false",
-                        diag.mb_online[3] ? "true" : "false");
+                        "%s{\"addr\":%u,\"errors\":%lu,\"online\":%s}",
+                        i ? "," : "",
+                        (unsigned)diag.mb_addrs[i],
+                        (unsigned long)diag.mb_errors[i],
+                        diag.mb_online[i] ? "true" : "false");
     }
+    if (pos < cap) pos += snprintf(buf + pos, sizeof(buf) - pos, "],");
 
     if (pos < cap) {
         snprintf(buf + pos, sizeof(buf) - pos, "\"wdt_stale\":0}");
@@ -264,6 +300,32 @@ static const ha_entity_t s_ha_entities[] = {
      "{{ value_json.conductivity }}", "\xC2\xB5S/cm", NULL, "mdi:flash", "sensor"},
     {"ro_plant_s3", "RO Perm2 Conductivity", "ro_plant/status/conductivity/s3",
      "{{ value_json.conductivity }}", "\xC2\xB5S/cm", NULL, "mdi:flash", "sensor"},
+    {"ro_plant_s4", "RO Concentrate Conductivity", "ro_plant/status/conductivity/s4",
+     "{{ value_json.conductivity }}", "\xC2\xB5S/cm", NULL, "mdi:flash", "sensor"},
+
+    /* Счётчики электроэнергии KWS-306L (добавлено 2026-05-09) */
+    /* НД-насос (PUMP_LP, slave 20) — 5 сенсоров */
+    {"ro_plant_lp_voltage", "RO LP Pump Voltage", "ro_plant/status/power/lp",
+     "{{ value_json.voltage }}", "V", "voltage", "mdi:flash", "sensor"},
+    {"ro_plant_lp_current", "RO LP Pump Current", "ro_plant/status/power/lp",
+     "{{ value_json.current }}", "A", "current", "mdi:current-ac", "sensor"},
+    {"ro_plant_lp_power", "RO LP Pump Power", "ro_plant/status/power/lp",
+     "{{ value_json.power }}", "W", "power", "mdi:lightning-bolt", "sensor"},
+    {"ro_plant_lp_energy", "RO LP Pump Energy", "ro_plant/status/power/lp",
+     "{{ value_json.energy }}", "kWh", "energy", "mdi:counter", "sensor"},
+    {"ro_plant_lp_temperature", "RO LP Pump Temperature", "ro_plant/status/power/lp",
+     "{{ value_json.temperature }}", "\xC2\xB0" "C", "temperature", "mdi:thermometer", "sensor"},
+    /* ВД-насос (PUMP_HP, slave 21) — 5 сенсоров */
+    {"ro_plant_hp_voltage", "RO HP Pump Voltage", "ro_plant/status/power/hp",
+     "{{ value_json.voltage }}", "V", "voltage", "mdi:flash", "sensor"},
+    {"ro_plant_hp_current", "RO HP Pump Current", "ro_plant/status/power/hp",
+     "{{ value_json.current }}", "A", "current", "mdi:current-ac", "sensor"},
+    {"ro_plant_hp_power", "RO HP Pump Power", "ro_plant/status/power/hp",
+     "{{ value_json.power }}", "W", "power", "mdi:lightning-bolt", "sensor"},
+    {"ro_plant_hp_energy", "RO HP Pump Energy", "ro_plant/status/power/hp",
+     "{{ value_json.energy }}", "kWh", "energy", "mdi:counter", "sensor"},
+    {"ro_plant_hp_temperature", "RO HP Pump Temperature", "ro_plant/status/power/hp",
+     "{{ value_json.temperature }}", "\xC2\xB0" "C", "temperature", "mdi:thermometer", "sensor"},
 
     /* Телеметрия */
     {"ro_plant_filter_dp", "RO Filter dP", "ro_plant/status/telemetry",

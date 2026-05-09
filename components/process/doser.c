@@ -1,6 +1,9 @@
 /**
  * @file doser.c
  * @brief Таймер дозатора антискаланта
+ *
+ * TODO (отложено): дозирование в WASHING с отдельной периодикой —
+ * см. README.md, раздел "TODO: дозатор в WASHING".
  */
 #include "doser.h"
 #include "config_manager.h"
@@ -41,7 +44,9 @@ doser_state_t doser_get_state(void)
 
 void doser_update(bool auto_running)
 {
-    const plant_config_t *cfg = config_manager_get();
+    /* Phase-2 (H-1): атомарный снимок секции doser */
+    config_doser_t dcfg;
+    config_manager_get_doser(&dcfg);
     int64_t now = esp_timer_get_time();
 
     /* Дозатор активен только в AUTO + если включён */
@@ -55,8 +60,8 @@ void doser_update(bool auto_running)
         return;
     }
 
-    int64_t run_us = (int64_t)cfg->doser.run_time_min * 60 * 1000000LL;
-    int64_t cycle_us = (int64_t)cfg->doser.cycle_time_min * 60 * 1000000LL;
+    int64_t run_us = (int64_t)dcfg.run_time_min * 60 * 1000000LL;
+    int64_t cycle_us = (int64_t)dcfg.cycle_time_min * 60 * 1000000LL;
     int64_t pause_us = cycle_us - run_us;
 
     switch (s_state) {
@@ -65,7 +70,7 @@ void doser_update(bool auto_running)
         s_state = DOSER_RUNNING;
         s_timer_start = now;
         hal_gpio_write_do_pin(BOARD_DO_DOSER, true);
-        ESP_LOGI(TAG, "Дозатор ВКЛ (%ld мин)", (long)cfg->doser.run_time_min);
+        ESP_LOGI(TAG, "Дозатор ВКЛ (%ld мин)", (long)dcfg.run_time_min);
         break;
 
     case DOSER_RUNNING:
@@ -74,7 +79,7 @@ void doser_update(bool auto_running)
             s_timer_start = now;
             hal_gpio_write_do_pin(BOARD_DO_DOSER, false);
             ESP_LOGI(TAG, "Дозатор ПАУЗА (%ld мин)",
-                     (long)(cfg->doser.cycle_time_min - cfg->doser.run_time_min));
+                     (long)(dcfg.cycle_time_min - dcfg.run_time_min));
         }
         break;
 
@@ -83,7 +88,7 @@ void doser_update(bool auto_running)
             s_state = DOSER_RUNNING;
             s_timer_start = now;
             hal_gpio_write_do_pin(BOARD_DO_DOSER, true);
-            ESP_LOGI(TAG, "Дозатор ВКЛ (%ld мин)", (long)cfg->doser.run_time_min);
+            ESP_LOGI(TAG, "Дозатор ВКЛ (%ld мин)", (long)dcfg.run_time_min);
         }
         break;
     }

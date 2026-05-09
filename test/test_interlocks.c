@@ -14,6 +14,8 @@
 #include "mock_config_manager.h"
 #include "mock_analog_input.h"
 
+#include <math.h>
+
 void setUp(void)
 {
     mock_hal_gpio_reset();
@@ -116,7 +118,56 @@ void test_interlocks_temperature_overshoot(void)
     TEST_ASSERT_TRUE(r.allow_pump_feed);
 }
 
-/* 6. Manual mode → только E-STOP проверяется */
+/* 6. Phase-1 (K-1): отказ датчика P1 (NaN) → блокировка pump_feed.
+ * До фикса: NaN молча пропускал проверку → насос работал без защиты. */
+void test_interlocks_p1_sensor_fault_blocks_pump_feed(void)
+{
+    mock_hal_gpio_set_di(0xFF);
+    mock_analog_set(AI_CH_P1, NAN);  /* обрыв датчика P1 */
+
+    interlock_result_t r;
+    interlocks_check(false, &r);
+
+    TEST_ASSERT_FALSE(r.allow_pump_feed);
+    TEST_ASSERT_EQUAL_UINT32(INTERLOCK_SENSOR_FAULT_P1,
+                             r.active_flags & INTERLOCK_SENSOR_FAULT_P1);
+    /* Остальные насосы не затронуты */
+    TEST_ASSERT_TRUE(r.allow_pump_stage1);
+    TEST_ASSERT_TRUE(r.allow_pump_stage2);
+    TEST_ASSERT_TRUE(r.allow_heater);
+}
+
+/* 7. Phase-1 (K-1): отказ P3 → блокировка pump_stage1 */
+void test_interlocks_p3_sensor_fault_blocks_stage1(void)
+{
+    mock_hal_gpio_set_di(0xFF);
+    mock_analog_set(AI_CH_P3, NAN);
+
+    interlock_result_t r;
+    interlocks_check(false, &r);
+
+    TEST_ASSERT_FALSE(r.allow_pump_stage1);
+    TEST_ASSERT_EQUAL_UINT32(INTERLOCK_SENSOR_FAULT_P3,
+                             r.active_flags & INTERLOCK_SENSOR_FAULT_P3);
+    TEST_ASSERT_TRUE(r.allow_pump_feed);
+    TEST_ASSERT_TRUE(r.allow_pump_stage2);
+}
+
+/* 8. Phase-1 (K-1): отказ T → блокировка heater */
+void test_interlocks_t_sensor_fault_blocks_heater(void)
+{
+    mock_hal_gpio_set_di(0xFF);
+    mock_analog_set(AI_CH_T, NAN);
+
+    interlock_result_t r;
+    interlocks_check(false, &r);
+
+    TEST_ASSERT_FALSE(r.allow_heater);
+    TEST_ASSERT_EQUAL_UINT32(INTERLOCK_SENSOR_FAULT_T,
+                             r.active_flags & INTERLOCK_SENSOR_FAULT_T);
+}
+
+/* 9. Manual mode → только E-STOP проверяется */
 void test_interlocks_manual_mode_skips_checks(void)
 {
     /* Источник пуст + P1 высокое — но manual mode */
@@ -144,6 +195,9 @@ int main(void)
     RUN_TEST(test_interlocks_source_empty);
     RUN_TEST(test_interlocks_p3_high);
     RUN_TEST(test_interlocks_temperature_overshoot);
+    RUN_TEST(test_interlocks_p1_sensor_fault_blocks_pump_feed);
+    RUN_TEST(test_interlocks_p3_sensor_fault_blocks_stage1);
+    RUN_TEST(test_interlocks_t_sensor_fault_blocks_heater);
     RUN_TEST(test_interlocks_manual_mode_skips_checks);
     return UNITY_END();
 }

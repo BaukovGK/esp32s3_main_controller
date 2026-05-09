@@ -1,13 +1,26 @@
-# watchdog_task -- Сторожевой таймер процесса
+# watchdog_task -- Программный сторожевой таймер для нескольких задач
 
 ## Описание
 
-Модуль `watchdog_task` реализует программный сторожевой таймер (watchdog) для контроля работоспособности основной задачи управления (ProcessTask). Механизм основан на мониторинге счетчика циклов: ProcessTask должна вызывать `watchdog_feed()` каждый цикл, увеличивая счетчик. Задача watchdog проверяет счетчик каждую секунду. Если счетчик не обновляется:
+Модуль `watchdog_task` реализует **программный watchdog**, отслеживающий работоспособность нескольких FreeRTOS-задач одновременно (Phase-1, K-5).
 
-- **3 секунды:** аварийное отключение всех дискретных выходов (`hal_gpio_write_do(0x00)`) -- безопасное состояние.
-- **10 секунд:** принудительная перезагрузка ESP32 (`esp_restart()`).
+**До Phase-1** отслеживалась только `process_task`. Это означало:
+- зависание `io_task` (raw E-STOP) → не детектируется,
+- зависание `modbus_poller_task` → все датчики «замерзают», все NaN-проверки проходят, защита по давлению отключается.
 
-При восстановлении нормальной работы ProcessTask после аварийного отключения DO логируется предупреждение.
+**После Phase-1**:
+- любая задача может зарегистрироваться через `watchdog_register()`,
+- получает целочисленный handle,
+- при каждом полезном цикле вызывает `watchdog_feed_h(handle)`,
+- если счётчик клиента не меняется N секунд → отключение DO; M секунд → `esp_restart()`.
+
+Поведение при зависании (per-client пороги):
+
+| Клиент   | stale_off_s | stale_reboot_s | Назначение |
+|----------|-------------|----------------|-----------|
+| process  | 3           | 10             | Главный цикл управления |
+| io       | 3           | 5              | Debounce DI + raw E-STOP — критично |
+| modbus   | 15          | 0              | Polling RS-485 — некритично, без рестарта |
 
 **Файлы:**
 - Заголовочный: `include/watchdog_task.h`
@@ -20,34 +33,73 @@
 | Заголовок               | Назначение                                               |
 |-------------------------|----------------------------------------------------------|
 | `watchdog_task.h`       | Собственный заголовочный файл                            |
-| `hal_gpio.h`            | HAL-абстракция GPIO: аварийное отключение дискретных выходов |
-| `esp_log.h`             | Система логирования ESP-IDF                              |
-| `esp_system.h`          | Функция `esp_restart()` для перезагрузки ESP32           |
+| `hal_gpio.h`            | Аварийное отключение DO при stale (`hal_gpio_write_do(0)`) |
+| `esp_log.h`             | Логирование ESP-IDF                                      |
+| `esp_system.h`          | `esp_restart()` для рестарта                             |
 | `freertos/FreeRTOS.h`   | Ядро FreeRTOS                                            |
-| `freertos/task.h`       | Функция `vTaskDelay()` для периодического ожидания       |
+| `freertos/task.h`       | `vTaskDelay()`                                           |
+| `freertos/semphr.h`     | Mutex регистрации                                        |
+| `<stdatomic.h>`         | Atomic-инкремент счётчиков feed                          |
 
 ---
 
-## Константы (#define)
+## Константы
 
-| Константа              | Значение | Описание                                                        |
-|------------------------|----------|-----------------------------------------------------------------|
-| `WDT_CHECK_INTERVAL_MS`| 1000     | Интервал проверки watchdog, миллисекунды                        |
-| `WDT_DO_OFF_THRESHOLD` | 3        | Число секунд без обновления счетчика до аварийного отключения DO |
-| `WDT_REBOOT_THRESHOLD` | 10       | Число секунд без обновления счетчика до принудительной перезагрузки ESP32 |
+| Константа              | Значение | Описание                                                  |
+|------------------------|----------|-----------------------------------------------------------|
+| `WDT_CHECK_INTERVAL_MS`| 1000     | Период проверки клиентов watchdog'ом                      |
+| `WDT_MAX_CLIENTS`      | 6        | Максимум зарегистрированных клиентов                      |
+| `WDT_INVALID_HANDLE`   | -1       | Возвращается из `watchdog_register` при ошибке            |
 
 ---
 
-## Внутренние (static) переменные
+## Структура клиента (внутренняя)
 
-| Переменная        | Тип                  | Описание                                                                       |
-|-------------------|----------------------|--------------------------------------------------------------------------------|
-| `TAG`             | `const char *`       | Тег логирования, значение `"watchdog"`                                         |
-| `s_cycle_counter` | `volatile uint32_t`  | Счетчик циклов ProcessTask. Объявлен `volatile`, так как доступ осуществляется из двух задач (один писатель -- ProcessTask, один читатель -- watchdog_task). Увеличивается при каждом вызове `watchdog_feed()`. |
+```c
+typedef struct {
+    const char *name;
+    atomic_uint_fast32_t counter;  // инкрементируется feed'ом
+    uint32_t   last_seen;          // последнее значение counter
+    uint32_t   stale_off_s;        // секунд stale → DO=0
+    uint32_t   stale_reboot_s;     // секунд stale → esp_restart()
+    int        stale_count;
+    bool       in_use;
+} wdt_client_t;
+```
+
+Массив `s_clients[WDT_MAX_CLIENTS]` глобален. Регистрация `watchdog_register()` сериализуется через mutex `s_reg_lock`. Feed (`watchdog_feed_h`) — без блокировок (атомарный инкремент), быстрый и безопасный из любого контекста.
 
 ---
 
 ## Публичные функции
+
+### `watchdog_register`
+
+```c
+int watchdog_register(const char *name, uint32_t stale_off_s, uint32_t stale_reboot_s);
+```
+
+**Описание:** Регистрирует нового клиента, возвращает handle (>=0) либо `WDT_INVALID_HANDLE`.
+
+| Параметр | Назначение |
+|---|---|
+| `name` | Имя для логов (статический литерал, не копируется). |
+| `stale_off_s` | Через сколько секунд stale → `hal_gpio_write_do(0x00)`. Для критичных задач 3. |
+| `stale_reboot_s` | Через сколько секунд stale → `esp_restart()`. 0 = не перезагружать. |
+
+**Вызов:** ДО `xTaskCreate` соответствующей задачи. Handle передаётся задаче через arg.
+
+---
+
+### `watchdog_feed_h`
+
+```c
+void watchdog_feed_h(int handle);
+```
+
+**Описание:** Кормит клиента с указанным handle. Невалидный handle игнорируется. Атомарный инкремент `counter` без mutex.
+
+---
 
 ### `watchdog_feed`
 
@@ -55,13 +107,7 @@
 void watchdog_feed(void);
 ```
 
-**Описание:** Сбрасывает сторожевой таймер. Должна вызываться из ProcessTask на каждом цикле обработки. Увеличивает атомарный счетчик `s_cycle_counter` на 1. Пока счетчик изменяется, watchdog считает ProcessTask живой.
-
-**Параметры:** нет
-
-**Возвращает:** ничего (`void`)
-
-**Примечание:** Функция безопасна для вызова из ISR-контекста (простой инкремент volatile-переменной), однако предназначена для вызова из контекста задачи FreeRTOS.
+**Совместимость**: кормит handle 0 («process»). Если ещё не зарегистрирован — регистрируется автоматически с порогами 3/10 секунд. Используется в legacy-коде через `process_task`.
 
 ---
 
@@ -71,49 +117,76 @@ void watchdog_feed(void);
 void watchdog_task(void *arg);
 ```
 
-**Описание:** Точка входа задачи FreeRTOS для сторожевого таймера. Рекомендуемые параметры создания задачи: приоритет 7, размер стека 2048 байт. Задача работает бесконечно и никогда не завершается.
+**Точка входа FreeRTOS-задачи**, prio 7, стек 2K. Алгоритм:
 
-Алгоритм работы (бесконечный цикл):
-
-1. Ожидание 1 секунду (`vTaskDelay(pdMS_TO_TICKS(WDT_CHECK_INTERVAL_MS))`).
-2. Чтение текущего значения `s_cycle_counter`.
-3. Сравнение с предыдущим значением (`last_counter`):
-   - **Если значение не изменилось** (ProcessTask не работает):
-     - Увеличение счетчика `stale_count` на 1.
-     - Если `stale_count >= WDT_DO_OFF_THRESHOLD` (3 с): логирование ошибки и аварийное отключение всех дискретных выходов вызовом `hal_gpio_write_do(0x00)`. Вызывается на каждой итерации, пока ProcessTask не восстановится.
-     - Если `stale_count >= WDT_REBOOT_THRESHOLD` (10 с): логирование ошибки и вызов `esp_restart()` для перезагрузки микроконтроллера.
-   - **Если значение изменилось** (ProcessTask работает):
-     - Если ранее был превышен порог DO (`stale_count >= WDT_DO_OFF_THRESHOLD`), логируется предупреждение о восстановлении.
-     - Сброс `stale_count` в 0.
-     - Обновление `last_counter` текущим значением.
-
-**Параметры:**
-- `arg` -- параметр задачи FreeRTOS (не используется, может быть `NULL`)
-
-**Возвращает:** ничего (`void`), функция никогда не завершается.
+1. `vTaskDelay(1 сек)`.
+2. Для каждого `in_use` клиента:
+   - Снять `cur = atomic_load(counter)`.
+   - Если `cur == last_seen`: `stale_count++`.
+     - При `stale_count == stale_off_s`: лог + `hal_gpio_write_do(0x00)`.
+     - При `stale_count >= stale_reboot_s` (если `>0`): `esp_restart()`.
+   - Иначе: лог восстановления (если был alarm), `stale_count = 0`, `last_seen = cur`.
 
 ---
 
-## Локальные переменные watchdog_task
+## Пример использования (`app_main.c`)
 
-| Переменная    | Тип        | Описание                                                          |
-|---------------|------------|-------------------------------------------------------------------|
-| `last_counter`| `uint32_t` | Значение `s_cycle_counter` на предыдущей итерации проверки        |
-| `stale_count` | `int`      | Число последовательных секунд без обновления счетчика             |
+Handle передаётся через `arg` в `xTaskCreate`. Поскольку валидный handle == 0
+(первый зарегистрированный клиент), нельзя кодировать «нет watchdog'а» как
+`arg == NULL` и одновременно проверять `if (arg) ...` — handle 0 потеряется.
+Поэтому в `watchdog_task.h` определены два макроса:
+
+```c
+#define WDT_HANDLE_TO_ARG(h)  ((void *)(intptr_t)((h) + 1))
+#define WDT_ARG_TO_HANDLE(a)  ((a) ? (int)((intptr_t)(a) - 1) : WDT_INVALID_HANDLE)
+```
+
+На отправке прибавляем 1, на приёме отнимаем 1. `arg == NULL` →
+`handle = WDT_INVALID_HANDLE` (-1), задача может уйти в legacy fallback.
+
+```c
+int wdt_process = watchdog_register("process", 3, 10);
+int wdt_io      = watchdog_register("io",      3,  5);
+int wdt_modbus  = watchdog_register("modbus", 15,  0);
+
+xTaskCreate(modbus_poller_task, "modbus", ..., WDT_HANDLE_TO_ARG(wdt_modbus), ...);
+xTaskCreate(io_task,            "io",     ..., WDT_HANDLE_TO_ARG(wdt_io),     ...);
+xTaskCreate(process_task,       "process",..., WDT_HANDLE_TO_ARG(wdt_process),...);
+xTaskCreate(watchdog_task,      "watchdog",...,  NULL,                         ...);
+```
+
+В задаче:
+```c
+void process_task(void *arg) {
+    int h = WDT_ARG_TO_HANDLE(arg);   // -1 если arg == NULL
+    while (1) {
+        ... работа ...
+        if (h >= 0) watchdog_feed_h(h);
+        vTaskDelay(...);
+    }
+}
+```
+
+## Thread-safety регистрации (C-8)
+
+`register_internal` сначала полностью заполняет slot (`name`, `counter=0`,
+`last_seen=0`, пороги, `stale_count=0`, `in_use=true`) и только потом
+публикует его через `atomic_store(&s_count, cur+1, memory_order_release)`.
+
+`watchdog_task` и `watchdog_feed_h` читают `s_count` через
+`atomic_load(..., memory_order_acquire)`. Acquire/release-парность
+гарантирует: если поток видит инкремент `s_count`, он также видит
+все записи в slot, выполненные до release-store. Это исключает гонку,
+при которой watchdog_task мог бы прочитать частично заполненный slot.
 
 ---
 
-## Диаграмма работы
+## Поведение при отказах разных задач
 
-```
-ProcessTask каждый цикл:
-  watchdog_feed()  -->  s_cycle_counter++
+| Зависшая задача   | Через 3 с | Через 5 с | Через 10 с | Через 15 с |
+|-------------------|-----------|-----------|------------|------------|
+| process_task      | DO=0      | —         | restart    | —          |
+| io_task           | DO=0      | restart   | —          | —          |
+| modbus_poller_task| —         | —         | —          | DO=0       |
 
-watchdog_task каждую 1 сек:
-  current = s_cycle_counter
-  current == last_counter?
-    ДА: stale_count++
-        stale_count >= 3  -->  hal_gpio_write_do(0x00)  [отключение DO]
-        stale_count >= 10 -->  esp_restart()             [перезагрузка]
-    НЕТ: stale_count = 0, last_counter = current
-```
+`modbus` без рестарта потому, что отказ Modbus сам по себе не требует панического перезапуска: алармы `ALARM_MODBUS_OFFLINE` поднимаются из `process_task`, а `analog_input_get_value` начинает возвращать NaN — сработают `INTERLOCK_SENSOR_FAULT_*`.

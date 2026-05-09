@@ -12,8 +12,9 @@
 
 static const char *TAG = "hal_i2c";
 
-#define I2C_GLITCH_IGNORE_CNT  7
-#define I2C_TIMEOUT_MS         100
+#define I2C_GLITCH_IGNORE_CNT     7
+#define I2C_TIMEOUT_MS            100   /* timeout одной транзакции */
+#define I2C_BUS_LOCK_TIMEOUT_MS   200   /* timeout захвата мьютекса шины */
 
 static i2c_master_bus_handle_t s_bus_handle;
 static SemaphoreHandle_t s_mutex;
@@ -46,6 +47,19 @@ esp_err_t hal_i2c_init(void)
     return ESP_OK;
 }
 
+/* Захват мьютекса шины с конечным таймаутом.
+ * При таймауте — ESP_LOGE; вызывающий слой (process_task / state_machine)
+ * получит ESP_ERR_TIMEOUT и поднимет аларм. HAL не зависит от alarm_manager
+ * (избегаем циклической зависимости services ↔ board_hal). */
+static bool i2c_bus_lock(const char *who)
+{
+    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(I2C_BUS_LOCK_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGE(TAG, "I2C bus lock timeout (%s) — возможно зависла шина", who ? who : "?");
+        return false;
+    }
+    return true;
+}
+
 esp_err_t hal_i2c_write_reg(uint8_t dev_addr, uint8_t reg, uint8_t data)
 {
     /* Добавляем устройство на шину (кэширование в будущем, сейчас каждый раз) */
@@ -58,7 +72,7 @@ esp_err_t hal_i2c_write_reg(uint8_t dev_addr, uint8_t reg, uint8_t data)
     i2c_master_dev_handle_t dev_handle;
     esp_err_t ret;
 
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (!i2c_bus_lock("write_reg")) return ESP_ERR_TIMEOUT;
 
     ret = i2c_master_bus_add_device(s_bus_handle, &dev_cfg, &dev_handle);
     if (ret != ESP_OK) {
@@ -93,7 +107,7 @@ esp_err_t hal_i2c_read_reg(uint8_t dev_addr, uint8_t reg, uint8_t *data)
     i2c_master_dev_handle_t dev_handle;
     esp_err_t ret;
 
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (!i2c_bus_lock("read_reg")) return ESP_ERR_TIMEOUT;
 
     ret = i2c_master_bus_add_device(s_bus_handle, &dev_cfg, &dev_handle);
     if (ret != ESP_OK) {

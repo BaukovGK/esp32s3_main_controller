@@ -1,0 +1,262 @@
+Development Protocol V2
+Function Code Introduction
+Function Code	Description
+03	Read holding register
+04	Read input register
+06	Write single holding register
+10	Write multiple holding register
+Register Address Introduction
+Address (HEX)	Address storage content	Register value	Permission	Modbus Function Code
+3x0000
+……
+3x0007	Channels 1~8 input data	Read values as unsigned hexadecimal	Read	0x04
+4x1000
+……
+4x1007	Channels 1~8 data types	0x0000~0x0004 five ranges	Read/Write	0x03,0x06,0x10
+4x2000	UART Parameter	The high eight bits indicate the parity mode: 0x00~0x02
+The low eight bits indicate the baud rate mode: 0x00~0x07	Read/Write	0x03, 0x06
+4x4000	Device Address	Directly store Modbus address
+Device address: 0x0001-0x00FF	Read/Write	0x03, 0x06
+4x8000	Software Version	Converting to decimal and then shifting the decimal point two places to the left will represent the software version
+0x0064 = 100 = V1.00	Read	0x03
+Operation Command Introduction
+Read Analog Input Command
+Send code: 01 04 00 00 00 08 F1 CC
+
+Field	Description	Note
+01	Device Address	0x00 indicates the broadcast address, 0x01-0xFF indicates the device address
+04	04 command	Read input register
+00 00	Register Start Address	0x0000 - 0x0007 correspond to 1~8 input channels
+00 08	Register Number	The number of the registers to be read, which must not exceed the maximum number of the channels
+F1 CC	CRC16	The CRC16 checksum of the first 6 bytes of data
+Return code: 01 04 10 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 55 2C
+
+Field	Description	Note
+01	Device Address	0x00 indicates the broadcast address, 0x01-0xFF indicates the device address
+04	04 command	Read input register
+10	Byte Number	Data length
+00 00
+……
+00 00
+Register data	Indicates the values of analog inputs from channels 0 - 7
+An unsigned 16-bit identifier for a channel, with the higher bits first and the lower bits last
+The data range is determined by the output data type
+55 2C	CRC16	The CRC16 checksum of the first 6 bytes of data
+For example: [Address 1 device]
+
+Read 1-8 channels : 01 04 00 00 00 08 F1 CC
+Read 1 channel : 01 04 00 00 00 01 31 CA
+Read 2 channel : 01 04 00 01 00 01 60 0A
+Read 3-5 channels : 01 04 00 02 00 03 11 CB
+Read Channel Data Type Command
+Send code: 01 03 10 00 00 08 40 CC
+
+Field	Description	Note
+01	Device Address	0x00 indicates the broadcast address, 0x01-0xFF indicates the device address
+03	03 Command	Read holding register
+10 00	Register Start Address	0x1000 - 0x1007 correspond to 1~8 input channels
+00 08	Register Number	The number of the registers to be read, which must not exceed the maximum number of the channels
+40 CC	CRC16	The CRC16 checksum of the first 6 bytes of data
+Return code: 01 03 10 00 02 00 02 00 02 00 02 00 02 00 02 00 02 00 02 09 C3
+
+Field	Description	Note
+01	Device Address	0x00 indicates the broadcast address, 0x01-0xFF indicates the device address
+03	03 Command	Read holding register
+10	Byte Number	The number of all bytes of the returned status information
+00 02
+……
+00 02
+Data Type	Indicates data types of 0-7 channels, 0x0000~0x0004 represents five ranges
+0x0000: Range 0~5V, output range 0~5000 or 0~10000, unit mV;
+0x0001: Range 1~5V, output range 1000~5000 or 2~10V, output range 2000~10000, unit mV;
+0x0002: Range 0~20mA, output range 0~20000, unit uA;
+0x0003: Range 4~20mA, output range 4000~20000, unit uA;
+0x0004: Direct output of numerical code, output range 0~4096, requires linear conversion to obtain actual measured voltage and current;
+09 C3	CRC16	The CRC16 checksum of the first 6 bytes of data
+For example: [Address 1 device]
+
+Read data types for channels 1-8 : 01 03 10 00 00 08 40 CC
+Read data type for channel 1 : 01 03 10 00 00 01 80 CA
+Read data type for channel 2 : 01 03 10 01 00 01 D1 0A
+Read data type for channels 3-5 : 01 03 10 02 00 03 A0 CB
+Set Single-channel Data Type Command
+Send code: 01 06 10 00 00 03 CD 0B
+
+Field	Description	Note
+01	Device Address	0x00 indicates the broadcast address, 0x01-0xFF indicates the device address
+06	06 Command	Write single register
+10 00	Register Start Address	0x1000 - 0x1007 correspond to data types of 1~8 input channels
+00 03	Channel Data Type	Channel data types, 0x0000~0x0004 represents five ranges
+0x0000: Range 0~5V, output range 0~5000 or 0~10000, unit mV;
+0x0001: Range 1~5V, output range 1000~5000 or 2~10V, output range 2000~10000, unit mV;
+0x0002: Range 0~20mA, output range 0~20000, unit uA;
+0x0003: Range 4~20mA, output range 4000~20000, unit uA;
+0x0004: Direct output of numerical code, output range 0~4096, requires linear conversion to obtain actual measured voltage and current;
+CD 0B	CRC16	The CRC16 checksum of the first 6 bytes of data
+Return code: 01 06 10 00 00 03 CD 0B
+
+Field	Description	Note
+01	Device Address	0x00 indicates the broadcast address, 0x01-0xFF indicates the device address
+06	06 Command	Write single register
+10 00	Channel Data Type Address	0x1000 - 0x1007 correspond to data types of 1~8 input channels
+00 03	Channel Data Type	Channel data type, 0x0000~0x0004 represents five ranges
+CD 0B	CRC16	The CRC16 checksum of the first 6 bytes of data
+For example: [Address 1 device]
+
+Set data type to 0~20mA for channel 1 : 01 06 10 00 00 02 0C CB
+Read data type 4~20mA for channel 2: 01 06 10 01 00 03 9C CB
+Set Multi-channel Data Type Command
+Send code: 01 10 10 00 00 08 10 00 03 00 03 00 03 00 03 00 03 00 03 00 03 00 03 91 2B
+
+Field	Description	Note
+01	Device Address	0x00 indicates the broadcast address, 0x01-0xFF indicates the device address
+10	10 Command	Write multiple registers
+10 00	Register Start Address	0x1000 - 0x1007 correspond to data types of 1~8 input channels
+00 08	Register Number	Set register number, which must not exceed the maximum number of the channels
+10	Byte Number	Set the number of bytes to be output
+00 03
+……
+00 03
+Command	Corresponding to data types of 0-7 channels, 0x0000~0x0004 represents five ranges
+0x0000: Range 0~5V, output range 0~5000 or 0~10000, unit mV;
+0x0001: Range 1~5V, output range 1000~5000 or 2~10V, output range 2000~10000, unit mV;
+0x0002: Range 0~20mA, output range 0~20000, unit uA;
+0x0003: Range 4~20mA, output range 4000~20000, unit uA;
+0x0004: Direct output of numerical code, output range 0~4096, requires linear conversion to obtain actual measured voltage and current;
+91 2B	CRC16	The CRC16 checksum of the first 6 bytes of data
+Return code: 01 10 10 00 00 08 C5 0F
+
+Field	Description	Note
+01	Device Address	0x00 indicates the broadcast address, 0x01-0xFF indicates the device address
+10	10 Command	Write multiple registers
+10 00	Register Start Address	0x1000 - 0x1007 correspond to data types of 1~8 input channels
+00 08	Register Number	Set register number, which must not exceed the maximum number of the channels
+C5 0F	CRC16	The CRC16 checksum of the first 6 bytes of data
+For example: [Address 1 device]
+
+Read data type 4~20mA for channels 1-8: 01 10 10 00 00 08 10 00 03 00 03 00 03 00 03 00 03 00 03 00 03 00 03 91 2B
+Read data type 1~5V for channels 3-5 : 01 10 10 02 00 03 06 00 01 00 01 00 01 BE 4A
+Set Baudrate Command
+Send code: 00 06 20 00 00 05 43 D8
+
+Field	Description	Note
+00	Device Address	0x00 indicates the broadcast address, 0x01-0xFF indicates the device address
+06	06 command	Set the baud rate and device address
+20 00	Command Register	0x2000: set the baud rate; 0x4000: set the device address
+00	Parity Method	0x00: no parity, 0x01: even parity; 0x02: odd parity
+05	Baud Rate Value	Correspondence of baud rate values
+0x00: 4800
+0x01: 9600
+0x02: 19200
+0x03: 38400
+0x04: 57600
+0x05: 115200
+0x06: 128000
+0x07: 256000
+43 D8	CRC16	The CRC16 checksum of the first 6 bytes of data
+Return code: 00 06 20 00 00 05 43 D8
+
+Field	Description	Note
+00	Device Address	0x00 indicates the broadcast address, 0x01-0xFF indicates the device address
+06	06 command	Set the baud rate and device address
+20 00	Command Register	0x2000: set the baud rate; 0x4000: set the device address
+00	Parity Method	0x00: no parity, 0x01: odd parity; 0x02: even parity
+05	Baud Rate	Correspondence of baud rate values
+0x00: 4800
+0x01: 9600
+0x02: 19200
+0x03: 38400
+0x04: 57600
+0x05: 115200
+0x06: 128000
+0x07: 256000
+43 D8	CRC16	The CRC16 checksum of the first 6 bytes of data
+For example: [Address 1 device]
+
+Set the baud rate as 4800: 00 06 20 00 00 00 83 DB
+Set the baud rate as 9600: 00 06 20 00 00 01 42 1B
+Set the baud rate as 115200: 00 06 20 00 00 05 43 D8
+Set Device Address Command
+Send code: 00 06 40 00 00 01 5C 1B
+
+Field	Description	Note
+00	Device Address	0x00 indicates the broadcast address, 0x01-0xFF indicates the device address
+06	06 command	Set the baud rate and device address
+40 00	Command Register	0x2000: set the baud rate; 0x4000: set the device address
+00 01	Device Address	Set the device address, 0x0001-0x00FF
+5C 1B	CRC16	The CRC16 checksum of the first 6 bytes of data
+Return code: 00 06 40 00 00 01 5C 1B
+
+Field	Description	Note
+00	Device Address	0x00 indicates the broadcast address, 0x01-0xFF indicates the device address
+06	06 command	Set the baud rate and device address
+40 00	Command Register	0x2000: set the baud rate; 0x4000: set the device address
+00 01	Device Address	Set the device address, 0x0001-0x00FF
+5C 1B	CRC16	The CRC16 checksum of the first 6 bytes of data
+For example: [Address 1 device]
+
+Set the device address as 0x01: 00 06 40 00 00 01 5C 1B
+Set the device address as 0x02: 00 06 40 00 00 02 1C 1A
+Set the device address as 0x03: 00 06 40 00 00 03 DD DA
+Read Device Address Command
+Send code: 00 03 40 00 00 01 90 1B
+
+Field	Description	Note
+00	Device Address	0x00 indicates the broadcast address, 0x01-0xFF indicates the device address
+03	03 Command	Read the device address
+40 00	Command register	0x4000: read the device address, 0x8000: read software version
+00 01	Byte Number	Fixed 0x0001
+90 1B	CRC16	The CRC16 checksum of the first 6 bytes of data
+Return code: 01 03 02 00 01 79 84
+
+Field	Description	Note
+01	Device Address	0x00 indicates the broadcast address, 0x01-0xFF indicates the device address
+03	03 Command	Read the software version and device address
+02	Byte Number	The number of bytes returned
+00 01	Device Address	Set the device address, 0x0001-0x00FF
+79 84	CRC16	The CRC16 checksum of the first 6 bytes of data
+For example: [Address 2 device]
+
+Send: 00 03 40 00 00 01 90 1B
+Return : 02 03 02 00 02 7D 85     // Address 0x02
+Read Software Version Command
+Send code: 00 03 80 00 00 01 AC 1B
+
+Field	Description	Note
+00	Device Address	0x00 indicates the broadcast address, 0x01-0xFF indicates the device address
+03	03 Command	Read the software version and device address
+80 00	Command register	0x4000: read the device address, 0x8000: read software version
+00 01	Byte Number	Fixed 0x0001
+AC 1B	CRC16	The CRC16 checksum of the first 6 bytes of data
+Return code: 01 03 02 00 64 B9 AF
+
+Field	Description	Note
+01	Device Address	0x00 indicates the broadcast address, 0x01-0xFF indicates the device address
+03	03 Command	Read the software version and device address
+02	Byte Number	The number of bytes returned
+00 64	Software Version	Converting to decimal and then shifting the decimal point two places to the left will represent the software version
+0x0064 = 100 = V1.00
+B9 AF	CRC16	The CRC16 checksum of the first 6 bytes of data
+For example:
+
+Send: 00 03 80 00 00 01 AC 1B
+Return: 01 03 02 00 64 B9 AF       //0x0064 = 100 =V1.00
+Exception Function Code
+When the received command is incorrect or the device is abnormal, an exception response will be returned in the following format:
+
+Return: 01 85 03 02 91
+
+Field	Description	Note
+01	Device Address	0x00 indicates the broadcast address, 0x01-0xFF indicates the device address
+85	Exception Function Code	Exception function code = Request function code + 0x80
+03	Byte Number	Exception Code
+02 91	CRC16	The CRC16 checksum of the first 6 bytes of data
+An exception code is a single-byte value that indicates the type of error. Several commonly used exception codes defined by the Modbus protocol:
+
+Exception Code	Name	Description
+0x01	Illegal Function	The requested function code is not supported
+0x02	Illegal Data Address	The requested data address is incorrect
+0x03	Illegal Data Value	The requested data value or operation cannot be executed
+0x04	Server Failure	Server equipment failure
+0x05	Response	The request has been received and is being processed
+0x06	Device Busy	The device is currently busy and cannot perform the requested operation

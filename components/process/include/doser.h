@@ -5,6 +5,9 @@
  * Состояния: OFF → RUNNING → PAUSE → (цикл).
  * Активен только в AUTO при doser_enabled.
  * Управляет RO5 (BOARD_DO_DOSER).
+ *
+ * TODO (отложено): дозирование промывочного реагента в WASHING с собственной
+ *   периодикой. См. раздел "TODO: дозатор в WASHING" в README.md.
  */
 #pragma once
 

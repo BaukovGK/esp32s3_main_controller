@@ -28,9 +28,13 @@ typedef struct {
     } tasks[DIAG_MAX_TASKS];
     int task_count;
 
-    /* Modbus — slave-адреса 1, 2, 10, 11 */
-    uint32_t mb_errors[4];
-    bool     mb_online[4];
+    /* Modbus. Phase-4 (M-6): размер берётся из modbus_poller_get_slave_addrs.
+     * Сохраняем максимум 8 устройств — этого хватит до конца расширения. */
+    #define DIAG_MAX_MB_DEVICES  8
+    uint8_t  mb_addrs[DIAG_MAX_MB_DEVICES];
+    uint32_t mb_errors[DIAG_MAX_MB_DEVICES];
+    bool     mb_online[DIAG_MAX_MB_DEVICES];
+    size_t   mb_count;
 } diagnostics_data_t;
 
 /**

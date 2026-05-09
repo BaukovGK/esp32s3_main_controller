@@ -6,6 +6,14 @@
 
 **Потокобезопасность:** spinlock (`portMUX_TYPE s_mux`) защищает `s_config` при записи (все setter-функции `config_manager_set_*`) и при копировании всей конфигурации через `config_manager_get_copy()`. Чтение отдельных полей (`float`, `int32_t`) через `config_manager_get()` атомарно на ESP32 и не требует блокировки.
 
+**Phase-2 (H-1):** добавлены атомарные снимки **по секциям**:
+- `config_manager_get_pressure(out)` — атомарная копия `config_pressure_t`
+- `config_manager_get_doser(out)` — атомарная копия `config_doser_t`
+- `config_manager_get_washing(out)` — атомарная копия `config_washing_t`
+- `config_manager_get_timeouts(out)` — атомарная копия `config_timeouts_t`
+
+Использовать **на горячих путях** (`interlocks_check`, `state_machine_update`, `doser_update`), где раньше через `config_manager_get()->X` читались несколько полей подряд. Между чтениями setter мог обновить структуру под спинлоком → reader получал смешанные старые/новые поля. Per-section copy защищает от этого: вся секция (< 64 байт) копируется атомарно под spinlock'ом.
+
 **Файлы:**
 - Заголовочный: `include/config_manager.h`
 - Реализация: `config_manager.c`
@@ -43,6 +51,8 @@
 | `run_time_min`   | `int32_t` | 5            | Время работы дозатора за один цикл, минуты |
 | `cycle_time_min` | `int32_t` | 60           | Период цикла дозирования, минуты           |
 
+> **TODO:** для дозирования в WASHING планируются дополнительные поля `wash_run_time_min` и `wash_cycle_time_min` — см. README.md.
+
 ### `config_washing_t` -- Параметры промывки
 
 | Поле              | Тип       | По умолчанию | Описание                                             |
@@ -61,6 +71,7 @@
 |-------------------|-----------|--------------|-----------------------------------------------------------|
 | `pump_confirm_ms` | `int32_t` | 3000         | Таймаут ожидания подтверждения запуска насоса, миллисекунды |
 | `pump_ramp_ms`    | `int32_t` | 15000        | Время разгона устройства плавного пуска (УПП), миллисекунды |
+| `step_timeout_s`  | `int32_t` | 60           | **Phase-4**: таймаут шага AUTO (STARTING_PUMP1/2/3, FILLING_INTERM), сек. При превышении — `ALARM_STEP_TIMEOUT` + FAULT |
 
 ### `config_mqtt_t` -- Параметры MQTT-клиента
 
@@ -138,6 +149,8 @@
 | `CFG_PUMP_CONF_HI` | 10000   | Верхняя граница `pump_confirm_ms` |
 | `CFG_PUMP_RAMP_LO` | 5000    | Нижняя граница `pump_ramp_ms`     |
 | `CFG_PUMP_RAMP_HI` | 30000   | Верхняя граница `pump_ramp_ms`    |
+| `CFG_STEP_TIMEOUT_LO` | 10   | Нижняя граница `step_timeout_s`, сек |
+| `CFG_STEP_TIMEOUT_HI` | 600  | Верхняя граница `step_timeout_s`, сек |
 
 ### MQTT
 
@@ -190,6 +203,7 @@
 |-------------|----------------------------|--------|--------------------------|---------------------------|-----------|----------------------------------|
 | `pmp_conf`  | `timeouts.pump_confirm_ms` | int32  | `CFG_PUMP_CONF_LO` (1000)  | `CFG_PUMP_CONF_HI` (10000)  | 3000      | Таймаут подтверждения насоса, мс |
 | `pmp_ramp`  | `timeouts.pump_ramp_ms`    | int32  | `CFG_PUMP_RAMP_LO` (5000)  | `CFG_PUMP_RAMP_HI` (30000)  | 15000     | Время разгона УПП, мс           |
+| `step_to`   | `timeouts.step_timeout_s`  | int32  | `CFG_STEP_TIMEOUT_LO` (10) | `CFG_STEP_TIMEOUT_HI` (600) | 60        | Таймаут шага AUTO, сек          |
 
 ### MQTT
 
@@ -465,7 +479,7 @@ esp_err_t config_manager_set_washing(const config_washing_t *cfg);
 esp_err_t config_manager_set_timeouts(const config_timeouts_t *cfg);
 ```
 
-**Описание:** Обновляет секцию конфигурации таймаутов. Переданная структура сначала проходит валидацию (`validate_timeouts`), затем копируется в `s_config.timeouts` под защитой спинлока `s_mux` и сохраняется в NVS (ключи: `pmp_conf`, `pmp_ramp`).
+**Описание:** Обновляет секцию конфигурации таймаутов. Переданная структура сначала проходит валидацию (`validate_timeouts`), затем копируется в `s_config.timeouts` под защитой спинлока `s_mux` и сохраняется в NVS (ключи: `pmp_conf`, `pmp_ramp`, `step_to`).
 
 **Параметры:**
 - `cfg` -- указатель на структуру `config_timeouts_t` с новыми значениями

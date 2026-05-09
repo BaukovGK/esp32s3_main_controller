@@ -1,10 +1,13 @@
 /**
  * @file diagnostics.c
  * @brief Сбор системной диагностики
+ *
+ * Phase-4 (M-6): список Modbus-устройств берётся из modbus_poller'а
+ * (раньше дублировался жёстко прописанным массивом, при добавлении
+ * устройств diagnostics не обновлялся).
  */
 #include "diagnostics.h"
 #include "modbus_poller.h"
-#include "board_config.h"
 
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -17,11 +20,6 @@ static struct {
     TaskHandle_t  handle;
 } s_tasks[DIAG_MAX_TASKS];
 static int s_task_count = 0;
-
-/* Modbus slave-адреса для мониторинга */
-static const uint8_t s_mb_addrs[] = {
-    MB_ADDR_WAVESHARE_AI, MB_ADDR_URZH2KM, MB_ADDR_SL21_201, MB_ADDR_SL21_101
-};
 
 void diagnostics_register_task(const char *name, TaskHandle_t handle)
 {
@@ -49,9 +47,10 @@ void diagnostics_collect(diagnostics_data_t *out)
             uxTaskGetStackHighWaterMark(s_tasks[i].handle) * sizeof(StackType_t);
     }
 
-    /* Modbus ошибки и онлайн-статус */
-    for (int i = 0; i < (int)(sizeof(s_mb_addrs) / sizeof(s_mb_addrs[0])); i++) {
-        out->mb_errors[i] = modbus_poller_get_error_count(s_mb_addrs[i]);
-        out->mb_online[i] = modbus_poller_is_device_online(s_mb_addrs[i]);
+    /* Modbus — динамический список из poller'а */
+    out->mb_count = modbus_poller_get_slave_addrs(out->mb_addrs, DIAG_MAX_MB_DEVICES);
+    for (size_t i = 0; i < out->mb_count; i++) {
+        out->mb_errors[i] = modbus_poller_get_error_count(out->mb_addrs[i]);
+        out->mb_online[i] = modbus_poller_is_device_online(out->mb_addrs[i]);
     }
 }
