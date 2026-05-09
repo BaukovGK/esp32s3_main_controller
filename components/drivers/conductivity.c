@@ -1,13 +1,19 @@
 /**
  * @file conductivity.c
- * @brief Драйвер кондуктометров СЛ21
+ * @brief Драйвер кондуктометров СЛ21 — 4 канала на двух блоках
  *
- * Addr 10 (6 рег): [σ1_hi, σ1_lo, T1, σ2_hi, σ2_lo, T2]
- * Addr 11 (3 рег): [σ3_hi, σ3_lo, T3]
- * Электропроводность: uint32(hi,lo) / 100 → µS/cm
+ * Addr 10 (6 рег): [σ1_hi, σ1_lo, T1, σ2_hi, σ2_lo, T2] → FEED + PERM1
+ * Addr 11 (6 рег): [σ3_hi, σ3_lo, T3, σ4_hi, σ4_lo, T4] → PERM2 + CONC
+ *
+ * Электропроводность: uint32(hi,lo) / 100 → µS/cm  (СЛ21-100Т, делитель 100)
  * Температура: int16 / 10 → °C
  *
+ * ⚠️ Word-order СЛ21: HI в МЛАДШЕМ адресе регистра (40001 = HI, 40002 = LO).
+ * В реализации нашего esp-modbus master регистры читаются в порядке адресации,
+ * поэтому в массиве c10/c11 [0]=HI и [1]=LO. См. doc/sl21.pdf п.5.16.3.
+ *
  * Phase-4 (M-4): spinlock защищает s_data от гонок process_task ↔ mqtt/httpd.
+ * 2026-05-09: расширено с 3 до 4 каналов (добавлен COND_CH_CONC через slave 11 X2/t2).
  */
 #include "conductivity.h"
 #include "modbus_poller.h"
@@ -79,11 +85,18 @@ void conductivity_update(void)
     snapshot.temperature_C[COND_CH_PERM1]   = (int16_t)c10[SL21_CH_STRIDE + SL21_REG_TEMP] / SL21_TEMP_DIVISOR;
     snapshot.channel_ok[COND_CH_PERM1]      = dev10_on;
 
-    /* Addr 11, канал 1: σ3 */
+    /* Addr 11, канал 1: σ3 (пермеат 2-й ступени) */
     uint32_t raw3 = regs_to_uint32(c11[SL21_REG_COND_HI], c11[SL21_REG_COND_LO]);
     snapshot.conductivity_uS[COND_CH_PERM2] = (float)raw3 / SL21_COND_DIVISOR;
     snapshot.temperature_C[COND_CH_PERM2]   = (int16_t)c11[SL21_REG_TEMP] / SL21_TEMP_DIVISOR;
     snapshot.channel_ok[COND_CH_PERM2]      = dev11_on;
+
+    /* Addr 11, канал 2: σ4 (концентрат) — добавлено 2026-05-09 */
+    uint32_t raw4 = regs_to_uint32(c11[SL21_CH_STRIDE + SL21_REG_COND_HI],
+                                   c11[SL21_CH_STRIDE + SL21_REG_COND_LO]);
+    snapshot.conductivity_uS[COND_CH_CONC] = (float)raw4 / SL21_COND_DIVISOR;
+    snapshot.temperature_C[COND_CH_CONC]   = (int16_t)c11[SL21_CH_STRIDE + SL21_REG_TEMP] / SL21_TEMP_DIVISOR;
+    snapshot.channel_ok[COND_CH_CONC]      = dev11_on;
 
     portENTER_CRITICAL(&s_data_mux);
     s_data = snapshot;

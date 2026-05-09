@@ -168,7 +168,8 @@ static const mb_parameter_descriptor_t s_device_params[] = {
         .param_opts     = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
         .access         = PAR_PERMS_READ
     },
-    /* CID_COND_ADDR11: СЛ21 addr 11, holding regs 0x0001, 3 regs */
+    /* CID_COND_ADDR11: СЛ21 addr 11, holding regs 0x0001, 6 regs (X1+t1+X2+t2).
+     * Расширено с 3 до 6 регистров 2026-05-09 — даёт 4-й канал проводимости. */
     {
         .cid            = CID_COND_ADDR11,
         .param_key      = "Cond11",

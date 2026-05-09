@@ -22,8 +22,8 @@ typedef enum {
     CID_AI_CHANNELS = 0,    /* Waveshare AI: slave 1, input regs 0x0000-0x0007 */
     CID_FLOW_RATES,         /* УРЖ2КМ расход: slave 2, holding regs 0x0000-0x0007 */
     CID_FLOW_VOLUMES,       /* УРЖ2КМ объём: slave 2, holding regs 0x0036-0x0045 */
-    CID_COND_ADDR10,        /* СЛ21 addr 10: holding regs 0x0001-0x0006 */
-    CID_COND_ADDR11,        /* СЛ21 addr 11: holding regs 0x0001-0x0003 */
+    CID_COND_ADDR10,        /* СЛ21 addr 10: holding regs 0x0001-0x0006 (X1+t1+X2+t2) */
+    CID_COND_ADDR11,        /* СЛ21 addr 11: holding regs 0x0001-0x0006 (X1+t1+X2+t2) */
     CID_COUNT
 } modbus_cid_t;
 
@@ -32,7 +32,10 @@ typedef enum {
 #define CID_FLOW_RATE_REG_COUNT 8
 #define CID_FLOW_VOL_REG_COUNT  16
 #define CID_COND10_REG_COUNT    6
-#define CID_COND11_REG_COUNT    3
+/* CID_COND11: расширено с 3 до 6 регистров (2026-05-09) — теперь читаем
+ * обе ячейки X1/X2 и оба термодатчика t1/t2 второго блока СЛ21. Это
+ * даёт 4-й логический канал проводимости COND_CH_CONC. */
+#define CID_COND11_REG_COUNT    6
 
 /**
  * @brief Инициализация esp-modbus master и регистрация параметров
