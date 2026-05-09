@@ -1,0 +1,34 @@
+# ESP-IDF build artifacts
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+build.log
+set-target.log
+
+# Host-test build
+test/build/
+
+# clangd / LSP local cache
+.clangd
+.cache/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Windows
+Thumbs.db
+
+# Claude Code local cache (не коммитим)
+.claude/
+
+# Локальные конфиги/секреты
+*.local.*
+secrets.h
