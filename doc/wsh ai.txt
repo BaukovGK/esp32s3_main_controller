@@ -1,0 +1,208 @@
+Secondary Development Protocol
+Function Code Introduction
+Function Code	Description
+03	Read holding registers
+04	Read Input Registers
+06	Write single holding register
+10	Write multiple holding registers
+Register Address Description
+Address (HEX)	Register Content	Register Value	Access	Modbus Function Code
+3x0000
+3x0001	Channel 1 Frequency High 16-bit
+Channel 1 Frequency Low 16-bit	Value is unsigned 32-bit hexadecimal, unit 0.01 Hz, range: 400~5000000, i.e., 400 Hz ~ 50 kHz	Read	0x04
+3x0002	Channel 1 Duty Cycle	Value is unsigned 16-bit hexadecimal, unit 0.01%, range 01000, i.e., 0100%	Read	0x04
+3x0003
+3x0004	Channel 2 Frequency High 16-bit
+Channel 2 Frequency Low 16-bit	Value is unsigned 32-bit hexadecimal, unit 0.01 Hz, range: 400~5000000, i.e., 400 Hz ~ 50 kHz	Read	0x04
+3x0005	Channel 2 Duty Cycle	Value is unsigned 16-bit hexadecimal, unit 0.01%, range 01000, i.e., 0100%	Read	0x04
+3x0006
+3x0007	Channel 3 Frequency High 16-bit
+Channel 3 Frequency Low 16-bit	Value is unsigned 32-bit hexadecimal, unit 0.01 Hz, range: 400~5000000, i.e., 400 Hz ~ 50 kHz	Read	0x04
+3x0008	Channel 3 Duty Cycle	Value is unsigned 16-bit hexadecimal, unit 0.01%, range 01000, i.e., 0100%	Read	0x04
+3x0009
+3x000A	Channel 4 Frequency High 16-bit
+Channel 4 Frequency Low 16-bit	Value is unsigned 32-bit hexadecimal, unit 0.01 Hz, range: 400~5000000, i.e., 400 Hz ~ 50 kHz	Read	0x04
+3x000B	Channel 4 Duty Cycle	Value is unsigned 16-bit hexadecimal, unit 0.01%, range 01000, i.e., 0100%	Read	0x04
+3x000C
+3x000D	Channel 5 Frequency High 16-bit
+Channel 5 Frequency Low 16-bit	Value is unsigned 32-bit hexadecimal, unit 0.01 Hz, range: 400~5000000, i.e., 400 Hz ~ 50 kHz	Read	0x04
+3x000E	Channel 5 Duty Cycle	Value is unsigned 16-bit hexadecimal, unit 0.01%, range 01000, i.e., 0100%	Read	0x04
+3x000F
+3x0010	Channel 6 Frequency High 16-bit
+Channel 6 Frequency Low 16-bit	Value is unsigned 32-bit hexadecimal, unit 0.01 Hz, range: 400~5000000, i.e., 400 Hz ~ 50 kHz	Read	0x04
+3x0011	Channel 6 Duty Cycle	Value is unsigned 16-bit hexadecimal, unit 0.01%, range 01000, i.e., 0100%	Read	0x04
+3x0012
+3x0013	Channel 7 Frequency High 16-bit
+Channel 7 Frequency Low 16-bit	Value is unsigned 32-bit hexadecimal, unit 0.01 Hz, range: 400~5000000, i.e., 400 Hz ~ 50 kHz	Read	0x04
+3x0014	Channel 7 Duty Cycle	Value is unsigned 16-bit hexadecimal, unit 0.01%, range 01000, i.e., 0100%	Read	0x04
+3x0015
+3x0016	Channel 8 Frequency High 16-bit
+Channel 8 Frequency Low 16-bit	Value is unsigned 32-bit hexadecimal, unit 0.01 Hz, range: 400~5000000, i.e., 400 Hz ~ 50 kHz	Read	0x04
+3x0017	Channel 8 Duty Cycle	Value is unsigned 16-bit hexadecimal, unit 0.01%, range 01000, i.e., 0100%	Read	0x04
+4x2000	Serial Port Parameters	High byte: parity mode: 0x000x02
+Low byte: baud rate mode: 0x000x07	Read/Write	0x03, 0x06
+4x4000	Device Address	Stores Modbus address directly
+Device address: 0x0001~0x00FF	Read/Write	0x03, 0x06
+4x8000	Software Version	Convert to decimal, then shift decimal point two places left for version
+0x0064 = 100 = V1.00	Read	0x03
+Operation Command Description
+Read Pulse Input Command
+Transmission Code: 01 04 00 00 00 03 B0 0B
+
+Field	Description	Note
+01	Device Address	0x00 indicates broadcast address; 0x01-0xFF indicate device address
+04	04 Command	Read Input Registers
+00 00	Register Start Address	Starting register for channel read. Each channel occupies three registers: first two store frequency, last stores duty cycle
+00 03	Number of Registers	Number of registers to read, cannot exceed maximum register count
+B0 0B	CRC16	CRC16 checksum of the first 6 bytes of data
+Return code: 01 04 06 00 3B 83 A5 03 01 7D C1
+
+Field	Description	Note
+01	Device Address	0x00 indicates broadcast address; 0x01-0xFF indicate device address
+04	04 Command	Read Input Registers
+06	Byte Count	Data length
+3B 83
+A5 03
+03 01	Register Data
+Frequency High 16-bit
+Frequency Low 16-bit
+Duty Cycle	Each channel occupies three registers: first two store frequency, last stores duty cycle
+Frequency is unsigned 32-bit hexadecimal, unit 0.01 Hz, range: 100 ~ 200000000, i.e., 1 Hz ~ 200 kHz
+Duty Cycle is unsigned 16-bit hexadecimal, unit 0.01 %, range 0 ~ 1000, i.e., 0 ~ 100%
+7D C1	CRC16	CRC16 checksum of the first 6 bytes of data
+Example: Device with address 1
+
+Read channels 1-8 : 01 04 00 00 00 18 F0 00
+Read channel 2 : 01 04 00 03 00 03 40 0B
+Read channels 3-5 : 01 04 00 06 00 09 D0 0D
+Read channel 1 : 01 04 00 00 00 03 B0 0B
+Return: 01 04 06 00 00 9C 40 13 88 42 41 //Channel 1, 400 Hz, 50% duty cycle
+
+Set Baud Rate Command
+Transmission Code: 00 06 20 00 00 05 43 D8
+
+Field	Description	Notes
+00	Device Address	0x00 indicates broadcast address; 0x01-0xFF indicate device address
+06	06 Command	Set baud rate, set device address
+20 00	Command Register	0x2000 for setting baud rate, 0x4000 for setting device address
+00	Parity Mode	0x00 for no parity, 0x01 for odd parity, 0x02 for even parity
+05	Baud Rate Value	Baud rate value mapping:
+0x00: 4800
+0x01: 9600
+0x02: 19200
+0x03: 38400
+0x04: 57600
+0x05: 115200
+0x06: 128000
+0x07: 256000
+43 D8	CRC16	CRC16 checksum of the first 6 bytes of data
+Return code: 00 06 20 00 00 05 43 D8
+
+Field	Description	Notes
+00	Device Address	0x00 indicates broadcast address; 0x01-0xFF indicate device address
+06	06 Command	Set baud rate, set device address
+20 00	Command Register	0x2000 for setting baud rate, 0x4000 for setting device address
+00	Parity Mode	0x00 for no parity, 0x01 for odd parity, 0x02 for even parity
+05	Baud Rate	Baud rate value mapping:
+0x00: 4800
+0x01: 9600
+0x02: 19200
+0x03: 38400
+0x04: 57600
+0x05: 115200
+0x06: 128000
+0x07: 256000
+43 D8	CRC16	CRC16 checksum of the first 6 bytes of data
+Example: Device with address 1
+
+Set baud rate 4800 : 00 06 20 00 00 00 83 DB
+Set baud rate 9600 : 00 06 20 00 00 01 42 1B
+Set baud rate 115200 : 00 06 20 00 00 05 43 D8
+
+Set Device Address Command
+Transmission Code: 00 06 40 00 00 01 5C 1B
+
+Field	Description	Notes
+00	Device Address	0x00 indicates broadcast address; 0x01-0xFF indicate device address
+06	06 Command	Set baud rate, set device address
+40 00	Command Register	0x2000 for setting baud rate, 0x4000 for setting device address
+00 01	Device Address	Device address to set, 0x0001-0x00FF
+5C 1B	CRC16	CRC16 checksum of the first 6 bytes of data
+Return Code: 00 06 40 00 00 01 5C 1B
+
+Field	Description	Notes
+00	Device Address	0x00 indicates broadcast address; 0x01-0xFF indicate device address
+06	06 Command	Set baud rate, set device address
+40 00	Command Register	0x2000 for setting baud rate, 0x4000 for setting device address
+00 01	Device Address	Device address set, 0x0001-0x00FF
+5C 1B	CRC16	CRC16 checksum of the first 6 bytes of data
+Example: Device with address 1
+
+Set device address to 0x01 : 00 06 40 00 00 01 5C 1B
+Set device address to 0x02 : 00 06 40 00 00 02 1C 1A
+Set device address to 0x03 : 00 06 40 00 00 03 DD DA
+
+Read Device Address Command
+Transmission code: 00 03 40 00 00 01 90 1B
+
+Field	Description	Notes
+00	Device Address	0x00 indicates broadcast address; 0x01-0xFF indicate device address
+03	03 Command	Read device address command
+40 00	Command Register	0x4000 for reading device address, 0x8000 for reading software version
+00 01	Byte Count	Fixed 0x0001
+90 1B	CRC16	CRC16 checksum of the first 6 bytes of data
+Return code: 01 03 02 00 01 79 84
+
+Field	Description	Notes
+01	Device Address	0x00 indicates broadcast address; 0x01-0xFF indicate device address
+03	03 Command	Read software version, read device address command
+02	Byte Count	Returned byte count
+00 01	Device Address	Device address set, 0x0001-0x00FF
+79 84	CRC16	CRC16 checksum of the first 6 bytes of data
+Example: Device with address 2
+
+Transmission code: 00 03 40 00 00 01 90 1B
+Return code : 02 03 02 00 02 7D 85 //Address 0x02
+
+Read Software Version Command
+Transmission code: 00 03 80 00 00 01 AC 1B
+
+Field	Description	Notes
+00	Device Address	0x00 indicates broadcast address; 0x01-0xFF indicate device address
+03	03 Command	Read software version, read device address command
+80 00	Command Register	0x4000 for reading device address, 0x8000 for reading software version
+00 01	Byte Count	Fixed 0x0001
+AC 1B	CRC16	CRC16 checksum of the first 6 bytes of data
+Return code: 01 03 02 00 64 B9 AF
+
+Field	Description	Notes
+01	Device Address	0x00 indicates broadcast address; 0x01-0xFF indicate device address
+03	03 Command	Read software version, read device address command
+02	Byte Count	Returned byte count
+00 64	Software Version	Convert to decimal, then shift decimal point two places left for version
+0x0064 = 100 = V1.00
+B9 AF	CRC16	CRC16 checksum of the first 6 bytes of data
+Example: Device with address 1
+
+Transmission Code: 00 03 80 00 00 01 AC 1B
+Return Code: 01 03 02 00 64 B9 AF       //0x0064 = 100 =V1.00
+
+Exception Function Codes
+If the received command is incorrect or an exception occurs, the device will return an exception response. The exception response format is as follows:
+
+Return Code: 01 85 03 02 91
+
+Field	Description	Notes
+01	Device Address	0x00 indicates broadcast address; 0x01-0xFF indicate device address
+85	Exception Function Code	Exception function code = Request function code + 0x80
+03	Byte Count	Exception code
+02 91	CRC16	CRC16 checksum of the first 6 bytes of data
+The exception code is a single-byte value indicating the type of error. Several common exception codes defined by the Modbus protocol:
+
+Exception Code	Name	Description
+0x01	Illegal Function	The requested function code is not supported
+0x02	Illegal Data Address	The requested data address is incorrect
+0x03	Illegal Data Value	The requested data value or operation cannot be performed
+0x04	Server Failure	Server device failure
+0x05	Acknowledge	Request received and processing
+0x06	Device Busy	Device is busy and cannot execute the requested operation

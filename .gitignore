@@ -13,6 +13,12 @@ test/build/
 .clangd
 .cache/
 
+# Файлы под doc/ ВСЕГДА сохраняем (PDF datasheet'ы, txt с протоколами).
+# Эта строка явно whitelists doc/ — на случай если кто-то добавит выше
+# что-то типа `*.txt` или `*.pdf` глобально.
+!doc/
+!doc/**
+
 # IDE / editor
 .vscode/
 .idea/
