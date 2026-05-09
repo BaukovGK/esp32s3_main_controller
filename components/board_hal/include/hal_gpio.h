@@ -68,6 +68,22 @@ void hal_gpio_debounce_process(void);
  */
 bool hal_gpio_is_estop_raw(void);
 
+/**
+ * @brief Проверка соответствия фактического состояния TCA9554 ожидаемому.
+ *
+ * Читает регистр OUTPUT TCA9554, сравнивает с кэшем s_do_state.
+ * Поднимает критический аларм ALARM_DO_READBACK_FAIL при расхождении —
+ * это означает, что физическое состояние реле не соответствует
+ * запросам state_machine (TCA9554 завис, шину выбило ESD, и т.п.).
+ *
+ * Вызывать раз в секунду из process_task.
+ *
+ * @return ESP_OK — состояние совпало,
+ *         ESP_ERR_INVALID_STATE — расхождение (аларм поднят),
+ *         иное — ошибка чтения I2C (аларм поднят).
+ */
+esp_err_t hal_gpio_verify_do(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -50,7 +50,7 @@
 
 | Имя | Значение | Описание |
 |-----|----------|----------|
-| `HA_ENTITY_COUNT` | `sizeof(s_ha_entities) / sizeof(s_ha_entities[0])` | Количество сущностей Home Assistant Discovery. Вычисляется автоматически из размера массива `s_ha_entities`. На данный момент = **22**. |
+| `HA_ENTITY_COUNT` | `sizeof(s_ha_entities) / sizeof(s_ha_entities[0])` | Количество сущностей Home Assistant Discovery. Вычисляется автоматически из размера массива `s_ha_entities`. На данный момент = **33** (22 базовых + s4 концентрат + 10 сенсоров KWS-306L; обновлено 2026-05-09). |
 
 ---
 
@@ -91,7 +91,7 @@ typedef struct {
 | Переменная | Тип | Описание |
 |------------|-----|----------|
 | `TAG` | `const char *` | Тег логирования: `"mqtt_pub"` |
-| `s_ha_entities[]` | `const ha_entity_t[22]` | Массив описаний всех сущностей Home Assistant Discovery (см. раздел 10) |
+| `s_ha_entities[]` | `const ha_entity_t[33]` | Массив описаний всех сущностей Home Assistant Discovery (см. раздел 10) |
 
 ---
 
@@ -210,7 +210,7 @@ void mqtt_publish_full_status(esp_mqtt_client_handle_t client);
 
 **Топики:** `ro_plant/status/conductivity/{name}` (QoS 0, без Retain)
 
-Где `{name}` принимает значения: `s1`, `s2`, `s3`.
+Где `{name}` принимает значения: `s1`, `s2`, `s3`, `s4` (4 канала, `COND_CHANNEL_COUNT = 4`).
 
 ```json
 {
@@ -228,11 +228,42 @@ void mqtt_publish_full_status(esp_mqtt_client_handle_t client);
 
 **Датчики:**
 
-| Имя | Назначение |
-|-----|------------|
-| `s1` | Кондуктивность входной воды (Feed) |
-| `s2` | Кондуктивность пермеата 1-й ступени |
-| `s3` | Кондуктивность пермеата 2-й ступени |
+| Имя | Источник Modbus | Назначение |
+|-----|-----------------|------------|
+| `s1` | slave 10 (SL21-201) X1/t1 | Кондуктивность входной (питательной) воды (Feed) |
+| `s2` | slave 10 X2/t2 | Кондуктивность пермеата 1-й ступени |
+| `s3` | slave 11 (SL21-101) X1/t1 | Кондуктивность пермеата 2-й ступени (товарный) |
+| `s4` | slave 11 X2/t2 | Кондуктивность концентрата (добавлен 2026-05-09) |
+
+##### 6.1.5a. Power meter -- счётчики электроэнергии KWS-306L (добавлено 2026-05-09)
+
+**Топики:** `ro_plant/status/power/{name}` (QoS 0, без Retain)
+
+Где `{name}` принимает значения: `lp` (НД-насос, slave 20), `hp` (ВД-насос, slave 21).
+
+Период публикации совпадает с остальными статусными топиками (каждый цикл `mqtt_publish_full_status`, ~1 с).
+
+```json
+{
+  "voltage": 230.5,
+  "current": 4.21,
+  "power": 970.5,
+  "energy": 12.34,
+  "temperature": 38.0,
+  "online": true
+}
+```
+
+| Поле | Тип | Описание |
+|------|-----|----------|
+| `voltage` | число/null | Напряжение питания насоса (В). `null` при `valid=false` (offline или до первого опроса). |
+| `current` | число/null | Ток (А). `null` при `valid=false`. |
+| `power` | число/null | Активная мощность (Вт). `null` при `valid=false`. |
+| `energy` | число/null | Накопленная энергия (кВт·ч). `null` при `valid=false`. |
+| `temperature` | число/null | Температура корпуса счётчика (°C). `null` при `valid=false`. |
+| `online` | bool | Устройство отвечает на Modbus-шине (по `modbus_poller_is_device_online`). |
+
+**Источник данных:** `power_meter_get_data(pump, &pm)` из компонента `drivers/power_meter`. Имена `lp/hp` соответствуют `pump_id_t` (PUMP_LP=0, PUMP_HP=1); сопоставление защищено `_Static_assert` против рассинхронизации `pump_names[]` ↔ `PUMP_COUNT` (по аналогии с `cond_names`).
 
 ##### 6.1.6. Telemetry -- вычисленные параметры
 
@@ -408,8 +439,8 @@ void mqtt_publish_diagnostics(esp_mqtt_client_handle_t client);
 | `heap_min` | число | Минимальный объём свободной кучи за время работы (байт) |
 | `uptime_s` | число | Время работы системы (секунды, конвертируется из микросекунд) |
 | `stack` | объект | Словарь: имя задачи -> свободный стек (байт). Перечисляются все зарегистрированные задачи. |
-| `modbus.errors` | массив[4] | Количество ошибок Modbus по каждому из 4 устройств |
-| `modbus.online` | массив[4] | Статус онлайн каждого из 4 Modbus-устройств |
+| `modbus.errors` | массив | Количество ошибок Modbus по каждому slave-устройству. Размер — динамический (по `mb_count` из `diagnostics_data_t`); список slaves берётся из `modbus_poller_get_slave_addrs` и дедуплицируется. |
+| `modbus.online` | массив | Статус онлайн каждого slave-устройства Modbus. Размер совпадает с `modbus.errors`. |
 | `wdt_stale` | число | Флаг "зависших" задач Watchdog (всегда 0 в текущей реализации) |
 
 ---
@@ -666,18 +697,21 @@ static void add_device_obj(cJSON *root);
 | 10 | `ro_plant/status/flow/Q2` | 0 | Нет | Каждый цикл | Расходомер Q2 |
 | 11 | `ro_plant/status/flow/Q3` | 0 | Нет | Каждый цикл | Расходомер Q3 |
 | 12 | `ro_plant/status/flow/Q4` | 0 | Нет | Каждый цикл | Расходомер Q4 |
-| 13 | `ro_plant/status/conductivity/s1` | 0 | Нет | Каждый цикл | Кондуктометр Feed |
-| 14 | `ro_plant/status/conductivity/s2` | 0 | Нет | Каждый цикл | Кондуктометр Perm1 |
-| 15 | `ro_plant/status/conductivity/s3` | 0 | Нет | Каждый цикл | Кондуктометр Perm2 |
-| 16 | `ro_plant/status/telemetry` | 0 | Нет | Каждый цикл | Вычисленные параметры |
-| 17 | `ro_plant/status/doser` | 0 | Нет | Каждый цикл | Состояние дозатора |
-| 18 | `ro_plant/status/interlocks` | 0 | Нет | Каждый цикл | Блокировки |
-| 19 | `ro_plant/status/diagnostics` | 0 | Нет | Каждый 6-й цикл | Диагностика |
-| 20 | `ro_plant/alarms` | 1 | Нет | По событию | Аварийные события |
+| 13 | `ro_plant/status/conductivity/s1` | 0 | Нет | Каждый цикл | Кондуктометр Feed (slave 10 X1) |
+| 14 | `ro_plant/status/conductivity/s2` | 0 | Нет | Каждый цикл | Кондуктометр Perm1 (slave 10 X2) |
+| 15 | `ro_plant/status/conductivity/s3` | 0 | Нет | Каждый цикл | Кондуктометр Perm2 (slave 11 X1) |
+| 16 | `ro_plant/status/conductivity/s4` | 0 | Нет | Каждый цикл | Кондуктометр Conc (slave 11 X2) |
+| 17 | `ro_plant/status/power/lp` | 0 | Нет | Каждый цикл | KWS-306L НД-насос (slave 20): V/A/W/kWh/°C/online |
+| 18 | `ro_plant/status/power/hp` | 0 | Нет | Каждый цикл | KWS-306L ВД-насос (slave 21): V/A/W/kWh/°C/online |
+| 19 | `ro_plant/status/telemetry` | 0 | Нет | Каждый цикл | Вычисленные параметры |
+| 20 | `ro_plant/status/doser` | 0 | Нет | Каждый цикл | Состояние дозатора |
+| 21 | `ro_plant/status/interlocks` | 0 | Нет | Каждый цикл | Блокировки |
+| 22 | `ro_plant/status/diagnostics` | 0 | Нет | Каждый 6-й цикл | Диагностика |
+| 23 | `ro_plant/alarms` | 1 | Нет | По событию | Аварийные события |
 
 ---
 
-## 8. Home Assistant Discovery -- полный список сущностей (22 шт.)
+## 8. Home Assistant Discovery -- полный список сущностей (33 шт.)
 
 ### 8.1. Группа: Состояние установки (2 sensor)
 
@@ -705,36 +739,54 @@ static void add_device_obj(cJSON *root);
 | 10 | `ro_plant_q3` | RO Q3 Flow | `ro_plant/status/flow/Q3` | `{{ value_json.flow }}` | m3/h | -- | `mdi:water` | `sensor` |
 | 11 | `ro_plant_q4` | RO Q4 Flow | `ro_plant/status/flow/Q4` | `{{ value_json.flow }}` | m3/h | -- | `mdi:water` | `sensor` |
 
-### 8.4. Группа: Кондуктометры (3 sensor)
+### 8.4. Группа: Кондуктометры (4 sensor)
 
 | # | object_id | name | state_topic | value_template | unit | device_class | icon | entity_type |
 |---|-----------|------|-------------|----------------|------|-------------|------|-------------|
 | 12 | `ro_plant_s1` | RO Feed Conductivity | `ro_plant/status/conductivity/s1` | `{{ value_json.conductivity }}` | uS/cm | -- | `mdi:flash` | `sensor` |
 | 13 | `ro_plant_s2` | RO Perm1 Conductivity | `ro_plant/status/conductivity/s2` | `{{ value_json.conductivity }}` | uS/cm | -- | `mdi:flash` | `sensor` |
 | 14 | `ro_plant_s3` | RO Perm2 Conductivity | `ro_plant/status/conductivity/s3` | `{{ value_json.conductivity }}` | uS/cm | -- | `mdi:flash` | `sensor` |
+| 15 | `ro_plant_s4` | RO Concentrate Conductivity | `ro_plant/status/conductivity/s4` | `{{ value_json.conductivity }}` | uS/cm | -- | `mdi:flash` | `sensor` |
 
-### 8.5. Группа: Телеметрия (4 sensor)
+### 8.5. Группа: Счётчики электроэнергии KWS-306L (10 sensor, добавлено 2026-05-09)
+
+5 сенсоров на каждый из двух насосов (НД-насос `lp` slave 20 и ВД-насос `hp` slave 21):
 
 | # | object_id | name | state_topic | value_template | unit | device_class | icon | entity_type |
 |---|-----------|------|-------------|----------------|------|-------------|------|-------------|
-| 15 | `ro_plant_filter_dp` | RO Filter dP | `ro_plant/status/telemetry` | `{{ value_json.filter_dp }}` | bar | pressure | -- | `sensor` |
-| 16 | `ro_plant_recovery` | RO System Recovery | `ro_plant/status/telemetry` | `{{ value_json.recovery_sys }}` | % | -- | `mdi:percent` | `sensor` |
-| 17 | `ro_plant_sel1` | RO Stage1 Selectivity | `ro_plant/status/telemetry` | `{{ value_json.sel1 }}` | % | -- | `mdi:percent` | `sensor` |
-| 18 | `ro_plant_sel2` | RO Stage2 Selectivity | `ro_plant/status/telemetry` | `{{ value_json.sel2 }}` | % | -- | `mdi:percent` | `sensor` |
+| 16 | `ro_plant_lp_voltage` | RO LP Pump Voltage | `ro_plant/status/power/lp` | `{{ value_json.voltage }}` | V | voltage | `mdi:flash` | `sensor` |
+| 17 | `ro_plant_lp_current` | RO LP Pump Current | `ro_plant/status/power/lp` | `{{ value_json.current }}` | A | current | `mdi:current-ac` | `sensor` |
+| 18 | `ro_plant_lp_power` | RO LP Pump Power | `ro_plant/status/power/lp` | `{{ value_json.power }}` | W | power | `mdi:lightning-bolt` | `sensor` |
+| 19 | `ro_plant_lp_energy` | RO LP Pump Energy | `ro_plant/status/power/lp` | `{{ value_json.energy }}` | kWh | energy | `mdi:counter` | `sensor` |
+| 20 | `ro_plant_lp_temperature` | RO LP Pump Temperature | `ro_plant/status/power/lp` | `{{ value_json.temperature }}` | °C | temperature | `mdi:thermometer` | `sensor` |
+| 21 | `ro_plant_hp_voltage` | RO HP Pump Voltage | `ro_plant/status/power/hp` | `{{ value_json.voltage }}` | V | voltage | `mdi:flash` | `sensor` |
+| 22 | `ro_plant_hp_current` | RO HP Pump Current | `ro_plant/status/power/hp` | `{{ value_json.current }}` | A | current | `mdi:current-ac` | `sensor` |
+| 23 | `ro_plant_hp_power` | RO HP Pump Power | `ro_plant/status/power/hp` | `{{ value_json.power }}` | W | power | `mdi:lightning-bolt` | `sensor` |
+| 24 | `ro_plant_hp_energy` | RO HP Pump Energy | `ro_plant/status/power/hp` | `{{ value_json.energy }}` | kWh | energy | `mdi:counter` | `sensor` |
+| 25 | `ro_plant_hp_temperature` | RO HP Pump Temperature | `ro_plant/status/power/hp` | `{{ value_json.temperature }}` | °C | temperature | `mdi:thermometer` | `sensor` |
 
-### 8.6. Группа: Бинарные датчики (2 binary_sensor)
+### 8.6. Группа: Телеметрия (4 sensor)
+
+| # | object_id | name | state_topic | value_template | unit | device_class | icon | entity_type |
+|---|-----------|------|-------------|----------------|------|-------------|------|-------------|
+| 26 | `ro_plant_filter_dp` | RO Filter dP | `ro_plant/status/telemetry` | `{{ value_json.filter_dp }}` | bar | pressure | -- | `sensor` |
+| 27 | `ro_plant_recovery` | RO System Recovery | `ro_plant/status/telemetry` | `{{ value_json.recovery_sys }}` | % | -- | `mdi:percent` | `sensor` |
+| 28 | `ro_plant_sel1` | RO Stage1 Selectivity | `ro_plant/status/telemetry` | `{{ value_json.sel1 }}` | % | -- | `mdi:percent` | `sensor` |
+| 29 | `ro_plant_sel2` | RO Stage2 Selectivity | `ro_plant/status/telemetry` | `{{ value_json.sel2 }}` | % | -- | `mdi:percent` | `sensor` |
+
+### 8.7. Группа: Бинарные датчики (2 binary_sensor)
 
 | # | object_id | name | state_topic | value_template | device_class | icon | entity_type | payload_on | payload_off |
 |---|-----------|------|-------------|----------------|-------------|------|-------------|------------|-------------|
-| 19 | `ro_plant_estop` | RO E-STOP | `ro_plant/status/interlocks` | `{{ value_json.estop }}` | safety | `mdi:alert-octagon` | `binary_sensor` | `"true"` | `"false"` |
-| 20 | `ro_plant_filter_warn` | RO Filter Warning | `ro_plant/status/interlocks` | `{{ value_json.filter_warn }}` | problem | `mdi:filter` | `binary_sensor` | `"true"` | `"false"` |
+| 30 | `ro_plant_estop` | RO E-STOP | `ro_plant/status/interlocks` | `{{ value_json.estop }}` | safety | `mdi:alert-octagon` | `binary_sensor` | `"true"` | `"false"` |
+| 31 | `ro_plant_filter_warn` | RO Filter Warning | `ro_plant/status/interlocks` | `{{ value_json.filter_warn }}` | problem | `mdi:filter` | `binary_sensor` | `"true"` | `"false"` |
 
-### 8.7. Группа: Диагностика (2 sensor)
+### 8.8. Группа: Диагностика (2 sensor)
 
 | # | object_id | name | state_topic | value_template | unit | device_class | icon | entity_type |
 |---|-----------|------|-------------|----------------|------|-------------|------|-------------|
-| 21 | `ro_plant_heap` | RO Free Heap | `ro_plant/status/diagnostics` | `{{ value_json.heap_free }}` | B | data_size | `mdi:memory` | `sensor` |
-| 22 | `ro_plant_uptime_diag` | RO Uptime | `ro_plant/status/diagnostics` | `{{ value_json.uptime_s }}` | s | duration | -- | `sensor` |
+| 32 | `ro_plant_heap` | RO Free Heap | `ro_plant/status/diagnostics` | `{{ value_json.heap_free }}` | B | data_size | `mdi:memory` | `sensor` |
+| 33 | `ro_plant_uptime_diag` | RO Uptime | `ro_plant/status/diagnostics` | `{{ value_json.uptime_s }}` | s | duration | -- | `sensor` |
 
 ---
 
@@ -764,14 +816,25 @@ homeassistant/{entity_type}/ro_plant/{object_id}/config
 | 12 | `homeassistant/sensor/ro_plant/ro_plant_s1/config` |
 | 13 | `homeassistant/sensor/ro_plant/ro_plant_s2/config` |
 | 14 | `homeassistant/sensor/ro_plant/ro_plant_s3/config` |
-| 15 | `homeassistant/sensor/ro_plant/ro_plant_filter_dp/config` |
-| 16 | `homeassistant/sensor/ro_plant/ro_plant_recovery/config` |
-| 17 | `homeassistant/sensor/ro_plant/ro_plant_sel1/config` |
-| 18 | `homeassistant/sensor/ro_plant/ro_plant_sel2/config` |
-| 19 | `homeassistant/binary_sensor/ro_plant/ro_plant_estop/config` |
-| 20 | `homeassistant/binary_sensor/ro_plant/ro_plant_filter_warn/config` |
-| 21 | `homeassistant/sensor/ro_plant/ro_plant_heap/config` |
-| 22 | `homeassistant/sensor/ro_plant/ro_plant_uptime_diag/config` |
+| 15 | `homeassistant/sensor/ro_plant/ro_plant_s4/config` |
+| 16 | `homeassistant/sensor/ro_plant/ro_plant_lp_voltage/config` |
+| 17 | `homeassistant/sensor/ro_plant/ro_plant_lp_current/config` |
+| 18 | `homeassistant/sensor/ro_plant/ro_plant_lp_power/config` |
+| 19 | `homeassistant/sensor/ro_plant/ro_plant_lp_energy/config` |
+| 20 | `homeassistant/sensor/ro_plant/ro_plant_lp_temperature/config` |
+| 21 | `homeassistant/sensor/ro_plant/ro_plant_hp_voltage/config` |
+| 22 | `homeassistant/sensor/ro_plant/ro_plant_hp_current/config` |
+| 23 | `homeassistant/sensor/ro_plant/ro_plant_hp_power/config` |
+| 24 | `homeassistant/sensor/ro_plant/ro_plant_hp_energy/config` |
+| 25 | `homeassistant/sensor/ro_plant/ro_plant_hp_temperature/config` |
+| 26 | `homeassistant/sensor/ro_plant/ro_plant_filter_dp/config` |
+| 27 | `homeassistant/sensor/ro_plant/ro_plant_recovery/config` |
+| 28 | `homeassistant/sensor/ro_plant/ro_plant_sel1/config` |
+| 29 | `homeassistant/sensor/ro_plant/ro_plant_sel2/config` |
+| 30 | `homeassistant/binary_sensor/ro_plant/ro_plant_estop/config` |
+| 31 | `homeassistant/binary_sensor/ro_plant/ro_plant_filter_warn/config` |
+| 32 | `homeassistant/sensor/ro_plant/ro_plant_heap/config` |
+| 33 | `homeassistant/sensor/ro_plant/ro_plant_uptime_diag/config` |
 
 ---
 
@@ -793,7 +856,7 @@ homeassistant/{entity_type}/ro_plant/{object_id}/config
 - Проще поддерживать корректность JSON при изменении структуры.
 
 ### Устройство HA (device)
-Все 22 сущности привязываются к одному устройству `ro_plant_001` через функцию `add_device_obj`. В интерфейсе Home Assistant все сущности будут сгруппированы под одним устройством "RO Plant Controller".
+Все 33 сущности привязываются к одному устройству `ro_plant_001` через функцию `add_device_obj`. В интерфейсе Home Assistant все сущности будут сгруппированы под одним устройством "RO Plant Controller".
 
 ### Буфер публикации
 Используются локальные буферы:

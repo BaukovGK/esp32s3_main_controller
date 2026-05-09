@@ -50,6 +50,8 @@
 | `alarm_manager.h` | Менеджер аварий: `alarm_manager_init()` |
 | `diagnostics.h` | Диагностика: `diagnostics_register_task()` |
 | `mqtt_app.h` | MQTT-клиент: `mqtt_app_start()` |
+| `esp_system.h` | **Phase-2 (M-2)**: `esp_reset_reason()` для логирования причины предыдущей перезагрузки |
+| `hal_buzzer.h` | **Phase-3 (L-4)**: пьезо-зуммер для индикации аварий |
 
 ---
 
@@ -68,6 +70,8 @@
 | `TASK_WDT_STACK`     | 2048     | Размер стека задачи Watchdog, байт             |
 | `TASK_WDT_PRIO`      | 7        | Приоритет задачи Watchdog                      |
 | `IO_TASK_CYCLE_MS`   | 10       | Период цикла задачи IO (debounce + E-STOP), мс |
+
+**Phase-3 (M-7): soft-fail для не-критичных компонентов** — `web_server_start()` и `mqtt_app_start()` обёрнуты в проверку возврата (без `ESP_ERROR_CHECK`). Отказ сети/MQTT теперь не валит контроллер — установка продолжает управляться, оператор увидит warning-аларм.
 
 ---
 
@@ -149,7 +153,7 @@
 
 | Параметр | Тип | Описание |
 |----------|-----|----------|
-| `arg` | `void *` | Не используется (стандартная сигнатура задачи FreeRTOS) |
+| `arg` | `void *` | **Phase-1 (K-5)**: handle watchdog'а (через `(intptr_t)`). При valid handle вызывается `watchdog_feed_h(handle)` каждый цикл. |
 
 **Возвращаемое значение:** нет (бесконечный цикл)
 
@@ -284,36 +288,68 @@ telemetry_init();
 ```
 Инициализация: блокировки безопасности, конечный автомат процесса, дозатор антискаланта, модуль расчёта телеметрии.
 
-**Этап 9.5: Менеджер аварий**
+**Этап 9: Менеджер аварий (Phase-2: переставлен ДО state_machine_init)**
 ```c
 ESP_ERROR_CHECK(alarm_manager_init());
 ```
-Инициализация подсистемы управления авариями.
+Инициализация подсистемы управления авариями. Должен быть запущен **до** `state_machine_init()`, потому что SM при восстановлении из NVS может сразу поднять `ALARM_RESTART_DURING_OP`.
+
+**Этап 9.1: Phase-2 (M-2) — журналирование причины перезагрузки**
+```c
+log_reset_reason();  // читает esp_reset_reason()
+```
+Если причина не `POWERON` / `SW` / `DEEPSLEEP` / `USB` (panic, WDT, brownout) — поднимает `ALARM_UNEXPECTED_RESTART` с категорией WARNING. Оператор видит в истории, что система перезапускалась нештатно.
+
+**Этап 9.2: Логика процесса**
+```c
+interlocks_init();
+state_machine_init();   // Phase-2 (K-4): читает sm_state из NVS, может войти в FAULT
+doser_init();
+telemetry_init();
+```
+
+**Этап 9.6: Регистрация клиентов watchdog (Phase-1, K-5)**
+```c
+int wdt_process = watchdog_register("process", 3, 10);  // off 3с, restart 10с
+int wdt_io      = watchdog_register("io",      3,  5);  // off 3с, restart 5с
+int wdt_modbus  = watchdog_register("modbus", 15,  0);  // off 15с, без restart
+```
+Создаются handle'ы клиентов watchdog'а **до** запуска задач, чтобы передать их в `arg`. Раньше watchdog отслеживал только `process_task` — `io_task` и `modbus_poller_task` могли зависнуть незаметно.
 
 **Этап 10: Запуск FreeRTOS-задач**
 
-| Задача | Функция | Имя | Стек | Приоритет | Описание |
-|--------|---------|-----|------|-----------|----------|
-| Modbus | `modbus_poller_task` | `"modbus"` | `TASK_MODBUS_STACK` (4096) байт | `TASK_MODBUS_PRIO` (6) | Циклический опрос Modbus-устройств |
-| IO | `io_task` | `"io"` | `TASK_IO_STACK` (2048) байт | `TASK_IO_PRIO` (6) | Обработка DI/DO, E-STOP, debounce |
-| Process | `process_task` | `"process"` | `TASK_PROCESS_STACK` (8192) байт | `TASK_PROCESS_PRIO` (5) | Основная логика управления процессом |
-| Watchdog | `watchdog_task` | `"watchdog"` | `TASK_WDT_STACK` (2048) байт | `TASK_WDT_PRIO` (7) | Контроль работоспособности |
+| Задача | Функция | Имя | Стек | Приоритет | WDT off / restart |
+|--------|---------|-----|------|-----------|-------------------|
+| Modbus | `modbus_poller_task` | `"modbus"` | `TASK_MODBUS_STACK` (4096) байт | `TASK_MODBUS_PRIO` (6) | 15с / — |
+| IO | `io_task` | `"io"` | `TASK_IO_STACK` (2048) байт | `TASK_IO_PRIO` (6) | 3с / 5с |
+| Process | `process_task` | `"process"` | `TASK_PROCESS_STACK` (8192) байт | `TASK_PROCESS_PRIO` (5) | 3с / 10с |
+| Watchdog | `watchdog_task` | `"watchdog"` | `TASK_WDT_STACK` (2048) байт | `TASK_WDT_PRIO` (7) | (сам watchdog) |
+
+Handle watchdog'а передаётся каждой задаче через `arg` с использованием макросов `WDT_HANDLE_TO_ARG(h)` (отправка) и `WDT_ARG_TO_HANDLE(arg)` (приём) из `watchdog_task.h`. Encoding `+1` нужен, чтобы валидный handle == 0 не интерпретировался как «нет watchdog'а» (NULL). После распаковки задача вызывает `watchdog_feed_h(handle)` каждый цикл.
 
 Каждая задача после создания регистрируется в модуле диагностики через `diagnostics_register_task()` для мониторинга свободного стека.
 
-**Этап 11: HTTP-сервер**
+**Этап 11: HTTP-сервер (Phase-3 (M-7): soft-fail)**
 ```c
-ESP_ERROR_CHECK(web_server_start());
-```
-Запуск HTTP-сервера с REST API и раздачей статических файлов веб-интерфейса.
-
-**Этап 12: MQTT-клиент (условный)**
-```c
-if (config_manager_get()->mqtt.enabled) {
-    ESP_ERROR_CHECK(mqtt_app_start());
+esp_err_t r = web_server_start();
+if (r != ESP_OK) {
+    ESP_LOGE(...);
+    alarm_raise(ALARM_SYSTEM_START, ALARM_CAT_WARNING, ...);
 }
 ```
-MQTT-клиент запускается только если он включён в конфигурации (`mqtt.enabled`). Публикует телеметрию на настроенный брокер.
+Раньше использовался `ESP_ERROR_CHECK` → отказ httpd валил всю прошивку. Теперь система продолжает управление установкой даже без web-интерфейса.
+
+**Этап 12: MQTT-клиент (Phase-3 (M-7): soft-fail)**
+```c
+if (config_manager_get()->mqtt.enabled) {
+    esp_err_t r = mqtt_app_start();
+    if (r != ESP_OK) {
+        ESP_LOGE(...);
+        alarm_raise(ALARM_MQTT_DISCONNECT, ALARM_CAT_WARNING, ...);
+    }
+}
+```
+Аналогично — отказ MQTT не парализует контроллер.
 
 ---
 

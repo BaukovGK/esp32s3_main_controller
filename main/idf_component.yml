@@ -1,3 +1,7 @@
 dependencies:
   idf: ">=5.0"
   espressif/esp-modbus: "^2.0.0"
+  # Phase-4 (RGB LED): WS2812 на BOARD_RGB_LED_GPIO. led_strip — managed
+  # компонент Espressif. Если на плате другой LED — заменить на простые
+  # GPIO/PWM в hal_rgb.c или удалить эту зависимость.
+  espressif/led_strip: "^2.5.0"

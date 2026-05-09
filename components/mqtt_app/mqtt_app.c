@@ -33,6 +33,11 @@ static esp_mqtt_client_handle_t s_client = NULL;
 static TaskHandle_t s_task_handle = NULL;
 static volatile bool s_connected = false;
 
+/* Phase-2 (H-6): сериализация stop/start/reconnect.
+ * httpd может одновременно получить два POST /api/v1/config/mqtt — без mutex'а
+ * это вело к двойному esp_mqtt_client_destroy и краху. */
+static SemaphoreHandle_t s_lifecycle_lock = NULL;
+
 /* Потокобезопасная очередь аварий (FreeRTOS queue) */
 #define ALARM_QUEUE_SIZE        16
 
@@ -42,6 +47,11 @@ static volatile bool s_connected = false;
 #define MQTT_DIAG_CYCLE         6       /* публикация диагностики каждый N-й интервал */
 #define MQTT_RECONNECT_MS       5000
 #define MQTT_LWT_MSG            "offline"
+
+/* C-4: при переподключении надо перепубликовать активные аварии. Размер
+ * совпадает с MAX_ACTIVE в alarm_manager.c (32). На стеке ~768 байт — ок,
+ * стек event-обработчика ESP-IDF MQTT клиента обычно ≥ 6 кБ. */
+#define MQTT_REPUBLISH_MAX_ALARMS 32
 
 static QueueHandle_t s_alarm_queue = NULL;
 
@@ -55,6 +65,32 @@ static void alarm_notify_cb(const alarm_entry_t *entry)
     }
     if (s_task_handle) {
         xTaskNotifyGive(s_task_handle);
+    }
+}
+
+/* C-4: повторная публикация всех активных аварий после (пере)подключения.
+ *
+ * После MQTT_EVENT_DISCONNECTED брокер выкидывает не-retained сообщения,
+ * а ro_plant/alarms публикуется БЕЗ retain (см. mqtt_publish_alarm). Если
+ * мы только переоткрыли сессию, новые подписчики (HMI/диспетчер) не увидят
+ * текущее состояние, пока что-нибудь не поднимется/снимется заново.
+ *
+ * Решение: снимаем снапшот активных через alarm_get_active() (он сам берёт
+ * lock alarm_manager, копирует и отпускает), затем уже вне любого lock'а
+ * публикуем каждую запись тем же путём, что и raise — mqtt_publish_alarm,
+ * тот же топик, тот же JSON. Дедлоков с s_lock alarm_manager не будет:
+ * publish ничего обратно в alarm_manager не зовёт.
+ */
+static void republish_active_alarms(void)
+{
+    alarm_entry_t snapshot[MQTT_REPUBLISH_MAX_ALARMS];
+    int cnt = alarm_get_active(snapshot, MQTT_REPUBLISH_MAX_ALARMS);
+    if (cnt <= 0) {
+        return;
+    }
+    ESP_LOGI(TAG, "Re-publish %d активных аварий после reconnect", cnt);
+    for (int i = 0; i < cnt; i++) {
+        mqtt_publish_alarm(s_client, &snapshot[i]);
     }
 }
 
@@ -81,6 +117,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 
         /* Снимаем аварию отключения (если была) */
         alarm_clear(ALARM_MQTT_DISCONNECT);
+
+        /* C-4: после reconnect перепубликовать активные аварии — иначе
+         * подписчики (HMI/диспетчер) видят устаревшее состояние, т.к.
+         * ro_plant/alarms не retained. Должно идти ПОСЛЕ alarm_clear, чтобы
+         * только что снятая ALARM_MQTT_DISCONNECT не попала в снапшот. */
+        republish_active_alarms();
 
         /* Будим задачу для немедленной публикации */
         if (s_task_handle) {
@@ -149,7 +191,26 @@ static void mqtt_task(void *arg)
 
 /* --- Публичные функции --- */
 
+/* Внутренняя реализация без захвата s_lifecycle_lock — caller должен держать его */
+static esp_err_t mqtt_app_start_locked(void);
+static void      mqtt_app_stop_locked(void);
+
 esp_err_t mqtt_app_start(void)
+{
+    if (s_lifecycle_lock == NULL) {
+        s_lifecycle_lock = xSemaphoreCreateMutex();
+        if (s_lifecycle_lock == NULL) return ESP_ERR_NO_MEM;
+    }
+    if (xSemaphoreTake(s_lifecycle_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGE(TAG, "mqtt_app_start: lifecycle lock timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t r = mqtt_app_start_locked();
+    xSemaphoreGive(s_lifecycle_lock);
+    return r;
+}
+
+static esp_err_t mqtt_app_start_locked(void)
 {
     if (s_client) {
         ESP_LOGW(TAG, "MQTT уже запущен");
@@ -229,6 +290,20 @@ esp_err_t mqtt_app_start(void)
 
 void mqtt_app_stop(void)
 {
+    if (s_lifecycle_lock == NULL) {
+        /* stop без предыдущего start — ничего не делаем */
+        return;
+    }
+    if (xSemaphoreTake(s_lifecycle_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGE(TAG, "mqtt_app_stop: lifecycle lock timeout");
+        return;
+    }
+    mqtt_app_stop_locked();
+    xSemaphoreGive(s_lifecycle_lock);
+}
+
+static void mqtt_app_stop_locked(void)
+{
     if (s_task_handle) {
         vTaskDelete(s_task_handle);
         s_task_handle = NULL;
@@ -249,7 +324,21 @@ bool mqtt_app_is_connected(void)
 
 esp_err_t mqtt_app_reconnect(void)
 {
+    /* Phase-2 (H-6): захватываем lock на ВЕСЬ stop+start, чтобы два параллельных
+     * вызова из httpd не привели к двойному destroy. */
+    if (s_lifecycle_lock == NULL) {
+        s_lifecycle_lock = xSemaphoreCreateMutex();
+        if (s_lifecycle_lock == NULL) return ESP_ERR_NO_MEM;
+    }
+    if (xSemaphoreTake(s_lifecycle_lock, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        ESP_LOGE(TAG, "mqtt_app_reconnect: lifecycle lock timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+
     ESP_LOGI(TAG, "Переподключение MQTT с новыми настройками...");
-    mqtt_app_stop();
-    return mqtt_app_start();
+    mqtt_app_stop_locked();
+    esp_err_t r = mqtt_app_start_locked();
+
+    xSemaphoreGive(s_lifecycle_lock);
+    return r;
 }

@@ -7,6 +7,8 @@
  */
 #include "modbus_poller.h"
 #include "board_config.h"
+#include "alarm_manager.h"
+#include "watchdog_task.h"
 
 #include "esp_modbus_master.h"
 #include "driver/uart.h"
@@ -16,6 +18,7 @@
 #include "freertos/semphr.h"
 
 #include <string.h>
+#include <math.h>
 
 static const char *TAG = "mb_poller";
 
@@ -27,11 +30,20 @@ static const char *TAG = "mb_poller";
 #define MB_POLL_PERIOD_FLOW_MS    1000
 #define MB_POLL_PERIOD_VOL_MS     2000
 #define MB_POLL_PERIOD_COND_MS    3000
+#define MB_POLL_PERIOD_KWS_MS     2000  /* KWS-306L: U/I/P/E раз в 2 секунды */
+
+/* --- Modbus function codes (literals — mb_proto.h приватный в esp-modbus v2) --- */
+#define MB_FC_READ_HOLDING_REGISTER     0x03
+#define MB_FC_WRITE_REGISTER            0x06
+#define MB_FC_WRITE_MULTIPLE_REGISTERS  0x10
 
 /* --- Прочие таймауты --- */
-#define MB_RESPONSE_TIMEOUT_MS    1000
+#define MB_RESPONSE_TIMEOUT_MS    300   /* Phase-1: было 1000, для отзывчивости */
 #define MB_BUS_INIT_DELAY_MS      500
 #define MB_POLL_TASK_INTERVAL_MS  10
+#define MB_DATA_LOCK_TIMEOUT_MS   100   /* Phase-1: вместо portMAX_DELAY (writer-side) */
+#define MB_GETTER_LOCK_TIMEOUT_MS 50    /* Phase-5 (C-9): короткий таймаут на reader'ах */
+#define MB_OFFLINE_BACKOFF_MS     30000 /* Phase-2 (H-9): offline-устройства опрашиваем раз в 30с */
 
 /* --- Макрос для строковых литералов в дескрипторах --- */
 #define STR(s) ((char *)(s))
@@ -48,6 +60,7 @@ typedef struct {
     size_t       reg_count;     /* количество uint16_t регистров */
     uint16_t    *data_buf;
     uint32_t     error_count;
+    bool         first_poll_done; /* Phase-5 (H-modbus-initial-state): true после первого УСПЕШНОГО опроса */
 } poll_entry_t;
 
 /* --- Буферы для хранения сырых регистров --- */
@@ -56,19 +69,52 @@ static uint16_t s_flow_data[CID_FLOW_RATE_REG_COUNT];
 static uint16_t s_volume_data[CID_FLOW_VOL_REG_COUNT];
 static uint16_t s_cond10_data[CID_COND10_REG_COUNT];
 static uint16_t s_cond11_data[CID_COND11_REG_COUNT];
+static uint16_t s_kws_lp_data[CID_KWS_REG_COUNT];
+static uint16_t s_kws_hp_data[CID_KWS_REG_COUNT];
 
-/* --- Таблица опроса --- */
+/* --- Таблица опроса (first_poll_done = false при старте) --- */
 static poll_entry_t s_poll_table[] = {
-    { CID_AI_CHANNELS, MB_ADDR_WAVESHARE_AI, MB_POLL_PERIOD_AI_MS,   0, CID_AI_REG_COUNT,        s_ai_data,     0 },
-    { CID_FLOW_RATES,  MB_ADDR_URZH2KM,     MB_POLL_PERIOD_FLOW_MS, 0, CID_FLOW_RATE_REG_COUNT, s_flow_data,   0 },
-    { CID_FLOW_VOLUMES,MB_ADDR_URZH2KM,     MB_POLL_PERIOD_VOL_MS,  0, CID_FLOW_VOL_REG_COUNT,  s_volume_data, 0 },
-    { CID_COND_ADDR10, MB_ADDR_SL21_201,    MB_POLL_PERIOD_COND_MS, 0, CID_COND10_REG_COUNT,    s_cond10_data, 0 },
-    { CID_COND_ADDR11, MB_ADDR_SL21_101,    MB_POLL_PERIOD_COND_MS, 0, CID_COND11_REG_COUNT,    s_cond11_data, 0 },
+    { CID_AI_CHANNELS, MB_ADDR_WAVESHARE_AI, MB_POLL_PERIOD_AI_MS,   0, CID_AI_REG_COUNT,        s_ai_data,     0, false },
+    { CID_FLOW_RATES,  MB_ADDR_URZH2KM,     MB_POLL_PERIOD_FLOW_MS, 0, CID_FLOW_RATE_REG_COUNT, s_flow_data,   0, false },
+    { CID_FLOW_VOLUMES,MB_ADDR_URZH2KM,     MB_POLL_PERIOD_VOL_MS,  0, CID_FLOW_VOL_REG_COUNT,  s_volume_data, 0, false },
+    { CID_COND_ADDR10, MB_ADDR_SL21_201,    MB_POLL_PERIOD_COND_MS, 0, CID_COND10_REG_COUNT,    s_cond10_data, 0, false },
+    { CID_COND_ADDR11, MB_ADDR_SL21_101,    MB_POLL_PERIOD_COND_MS, 0, CID_COND11_REG_COUNT,    s_cond11_data, 0, false },
+    { CID_KWS_PUMP_LP, MB_ADDR_KWS_PUMP_LP, MB_POLL_PERIOD_KWS_MS,  0, CID_KWS_REG_COUNT,       s_kws_lp_data, 0, false },
+    { CID_KWS_PUMP_HP, MB_ADDR_KWS_PUMP_HP, MB_POLL_PERIOD_KWS_MS,  0, CID_KWS_REG_COUNT,       s_kws_hp_data, 0, false },
 };
 #define POLL_TABLE_SIZE (sizeof(s_poll_table) / sizeof(s_poll_table[0]))
 
 /* --- Mutex для защиты данных --- */
 static SemaphoreHandle_t s_data_mutex;
+
+/* --- Watchdog handle (получаем при init) --- */
+static int s_wdt_handle = -1;
+
+/* Phase-5 (C-9): writer (poll task) использует MB_DATA_LOCK_TIMEOUT_MS,
+ * readers (геттеры) — короткий MB_GETTER_LOCK_TIMEOUT_MS, чтобы при
+ * зависании одного потока остальные не блокировались надолго. */
+static inline bool data_lock_timeout(const char *who, uint32_t timeout_ms, bool raise_alarm)
+{
+    if (xSemaphoreTake(s_data_mutex, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        ESP_LOGE(TAG, "data lock timeout (%s, %lums)", who ? who : "?",
+                 (unsigned long)timeout_ms);
+        if (raise_alarm) {
+            alarm_raise(ALARM_MB_DATA_LOCK_HUNG, ALARM_CAT_ALARM, 0);
+        }
+        return false;
+    }
+    return true;
+}
+
+static inline bool data_lock(const char *who)
+{
+    return data_lock_timeout(who, MB_DATA_LOCK_TIMEOUT_MS, true);
+}
+
+static inline void data_unlock(void)
+{
+    xSemaphoreGive(s_data_mutex);
+}
 
 /* --- Data Dictionary для esp-modbus v2 --- */
 static const mb_parameter_descriptor_t s_device_params[] = {
@@ -102,7 +148,7 @@ static const mb_parameter_descriptor_t s_device_params[] = {
         .param_opts     = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
         .access         = PAR_PERMS_READ
     },
-    /* CID_FLOW_VOLUMES: УРЖ2КМ объём, slave 2, holding regs 0x0036, 16 regs */
+    /* CID_FLOW_VOLUMES: УРЖ2КМ объём, slave 2, holding regs 0x0036, 8 regs (4 float-WS) */
     {
         .cid            = CID_FLOW_VOLUMES,
         .param_key      = "Vol",
@@ -132,7 +178,8 @@ static const mb_parameter_descriptor_t s_device_params[] = {
         .param_opts     = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
         .access         = PAR_PERMS_READ
     },
-    /* CID_COND_ADDR11: СЛ21 addr 11, holding regs 0x0001, 3 regs */
+    /* CID_COND_ADDR11: СЛ21 addr 11, holding regs 0x0001, 6 regs (X1+t1+X2+t2).
+     * Расширено с 3 до 6 регистров 2026-05-09 — даёт 4-й канал проводимости. */
     {
         .cid            = CID_COND_ADDR11,
         .param_key      = "Cond11",
@@ -144,6 +191,84 @@ static const mb_parameter_descriptor_t s_device_params[] = {
         .param_offset   = 0,
         .param_type     = PARAM_TYPE_ASCII,
         .param_size     = CID_COND11_REG_COUNT * 2,
+        .param_opts     = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
+        .access         = PAR_PERMS_READ
+    },
+    /* CID_KWS_PUMP_LP: KWS-306L slave 20 (НД-насос), holding regs 0x000E..0x001B (14 regs) */
+    {
+        .cid            = CID_KWS_PUMP_LP,
+        .param_key      = "KWS_LP",
+        .param_units    = "raw",
+        .mb_slave_addr  = MB_ADDR_KWS_PUMP_LP,
+        .mb_param_type  = MB_PARAM_HOLDING,
+        .mb_reg_start   = 0x000E,
+        .mb_size        = CID_KWS_REG_COUNT,
+        .param_offset   = 0,
+        .param_type     = PARAM_TYPE_ASCII,
+        .param_size     = CID_KWS_REG_COUNT * 2,
+        .param_opts     = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
+        .access         = PAR_PERMS_READ
+    },
+    /* CID_KWS_PUMP_HP: KWS-306L slave 21 (ВД-насос), holding regs 0x000E..0x001B (14 regs) */
+    {
+        .cid            = CID_KWS_PUMP_HP,
+        .param_key      = "KWS_HP",
+        .param_units    = "raw",
+        .mb_slave_addr  = MB_ADDR_KWS_PUMP_HP,
+        .mb_param_type  = MB_PARAM_HOLDING,
+        .mb_reg_start   = 0x000E,
+        .mb_size        = CID_KWS_REG_COUNT,
+        .param_offset   = 0,
+        .param_type     = PARAM_TYPE_ASCII,
+        .param_size     = CID_KWS_REG_COUNT * 2,
+        .param_opts     = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
+        .access         = PAR_PERMS_READ
+    },
+    /* --- Health-check (mb_device_check) --- */
+    /* CID_AI_MODES: Waveshare AI, holding 0x1000..0x1007, RW (one-time setup
+     * для перевода каналов в режим 4–20mA). В s_poll_table[] не входит —
+     * читается/пишется напрямую через mbc_master_send_request. */
+    {
+        .cid            = CID_AI_MODES,
+        .param_key      = "AI_modes",
+        .param_units    = "raw",
+        .mb_slave_addr  = MB_ADDR_WAVESHARE_AI,
+        .mb_param_type  = MB_PARAM_HOLDING,
+        .mb_reg_start   = 0x1000,
+        .mb_size        = CID_AI_MODES_COUNT,
+        .param_offset   = 0,
+        .param_type     = PARAM_TYPE_ASCII,
+        .param_size     = CID_AI_MODES_COUNT * 2,
+        .param_opts     = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
+        .access         = PAR_PERMS_READ_WRITE
+    },
+    /* CID_AI_VERSION: Waveshare AI, holding 0x8000, R-only — FW version */
+    {
+        .cid            = CID_AI_VERSION,
+        .param_key      = "AI_ver",
+        .param_units    = "raw",
+        .mb_slave_addr  = MB_ADDR_WAVESHARE_AI,
+        .mb_param_type  = MB_PARAM_HOLDING,
+        .mb_reg_start   = 0x8000,
+        .mb_size        = CID_AI_VERSION_COUNT,
+        .param_offset   = 0,
+        .param_type     = PARAM_TYPE_ASCII,
+        .param_size     = CID_AI_VERSION_COUNT * 2,
+        .param_opts     = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
+        .access         = PAR_PERMS_READ
+    },
+    /* CID_AI_DEV_ADDR: Waveshare AI, holding 0x4000, R-only — slave address */
+    {
+        .cid            = CID_AI_DEV_ADDR,
+        .param_key      = "AI_addr",
+        .param_units    = "raw",
+        .mb_slave_addr  = MB_ADDR_WAVESHARE_AI,
+        .mb_param_type  = MB_PARAM_HOLDING,
+        .mb_reg_start   = 0x4000,
+        .mb_size        = CID_AI_DEV_ADDR_COUNT,
+        .param_offset   = 0,
+        .param_type     = PARAM_TYPE_ASCII,
+        .param_size     = CID_AI_DEV_ADDR_COUNT * 2,
         .param_opts     = { .opt1 = 0, .opt2 = 0, .opt3 = 0 },
         .access         = PAR_PERMS_READ
     },
@@ -217,7 +342,12 @@ esp_err_t modbus_poller_init(void)
 
 void modbus_poller_task(void *arg)
 {
-    ESP_LOGI(TAG, "Задача опроса запущена");
+    /* Получаем handle watchdog'а из аргумента (encoding `+1`,
+     * см. WDT_HANDLE_TO_ARG в watchdog_task.h). NULL → -1 (без watchdog'а),
+     * иначе handle = (intptr_t)arg - 1. Это сохраняет валидный handle == 0. */
+    s_wdt_handle = WDT_ARG_TO_HANDLE(arg);
+
+    ESP_LOGI(TAG, "Задача опроса запущена (wdt_handle=%d)", s_wdt_handle);
 
     /* Начальная задержка для стабилизации шины */
     vTaskDelay(pdMS_TO_TICKS(MB_BUS_INIT_DELAY_MS));
@@ -228,42 +358,65 @@ void modbus_poller_task(void *arg)
         for (int i = 0; i < POLL_TABLE_SIZE; i++) {
             poll_entry_t *entry = &s_poll_table[i];
 
-            if ((now - entry->last_poll_ms) < entry->period_ms) {
+            /* Phase-2 (H-9): offline-устройства опрашиваем редко (раз в 30 сек),
+             * чтобы не блокировать шину RS-485 на 5×300мс при проблемах со связью.
+             * Когда устройство отвечает — error_count сбрасывается в 0
+             * → возвращаемся к нормальному периоду опроса. */
+            uint32_t period = entry->period_ms;
+            if (entry->error_count >= DEVICE_OFFLINE_THRESHOLD) {
+                period = MB_OFFLINE_BACKOFF_MS;
+            }
+            if ((now - entry->last_poll_ms) < period) {
                 continue;
             }
 
             /* Временный буфер для чтения */
-            uint8_t temp_buf[CID_FLOW_VOL_REG_COUNT * 2]; /* максимальный размер */
+            /* Размер по самому крупному CID; KWS_REG_COUNT=14 сейчас максимум.
+             * Если добавить новый CID >14 регистров — увеличить здесь. */
+            uint8_t temp_buf[CID_KWS_REG_COUNT * 2]; /* максимальный размер */
             uint8_t param_type = 0;
 
             esp_err_t err = mbc_master_get_parameter(
                 s_master_ctx, entry->cid, temp_buf, &param_type);
 
-            xSemaphoreTake(s_data_mutex, portMAX_DELAY);
-            if (err == ESP_OK) {
-                /* Конвертация из массива байт в uint16_t (big-endian Modbus) */
-                for (size_t r = 0; r < entry->reg_count; r++) {
-                    entry->data_buf[r] = (uint16_t)(temp_buf[r * 2] << 8) |
-                                          temp_buf[r * 2 + 1];
+            if (data_lock("poll")) {
+                if (err == ESP_OK) {
+                    /* Конвертация из массива байт в uint16_t (big-endian Modbus) */
+                    for (size_t r = 0; r < entry->reg_count; r++) {
+                        entry->data_buf[r] = (uint16_t)(temp_buf[r * 2] << 8) |
+                                              temp_buf[r * 2 + 1];
+                    }
+                    if (entry->error_count > 0) {
+                        ESP_LOGI(TAG, "Slave %d CID %d: связь восстановлена",
+                                 entry->slave_addr, entry->cid);
+                    }
+                    entry->error_count = 0;
+                    /* Phase-5 (H-modbus-initial-state): после первого
+                     * успешного чтения геттеры начинают возвращать данные. */
+                    if (!entry->first_poll_done) {
+                        entry->first_poll_done = true;
+                        ESP_LOGI(TAG, "Slave %d CID %d: первый успешный опрос",
+                                 entry->slave_addr, entry->cid);
+                    }
+                } else {
+                    entry->error_count++;
+                    if (entry->error_count == 1 ||
+                        entry->error_count == DEVICE_OFFLINE_THRESHOLD) {
+                        ESP_LOGW(TAG, "Slave %d CID %d: ошибка %s (cnt=%lu)",
+                                 entry->slave_addr, entry->cid,
+                                 esp_err_to_name(err),
+                                 (unsigned long)entry->error_count);
+                    }
                 }
-                if (entry->error_count > 0) {
-                    ESP_LOGI(TAG, "Slave %d CID %d: связь восстановлена",
-                             entry->slave_addr, entry->cid);
-                }
-                entry->error_count = 0;
-            } else {
-                entry->error_count++;
-                if (entry->error_count == 1 ||
-                    entry->error_count == DEVICE_OFFLINE_THRESHOLD) {
-                    ESP_LOGW(TAG, "Slave %d CID %d: ошибка %s (cnt=%lu)",
-                             entry->slave_addr, entry->cid,
-                             esp_err_to_name(err),
-                             (unsigned long)entry->error_count);
-                }
+                data_unlock();
             }
-            xSemaphoreGive(s_data_mutex);
 
             entry->last_poll_ms = now;
+        }
+
+        /* Кормим watchdog (Phase-1: K-5) */
+        if (s_wdt_handle >= 0) {
+            watchdog_feed_h(s_wdt_handle);
         }
 
         vTaskDelay(pdMS_TO_TICKS(MB_POLL_TASK_INTERVAL_MS));
@@ -272,58 +425,124 @@ void modbus_poller_task(void *arg)
 
 /* --- Потокобезопасные getter-функции --- */
 
-static esp_err_t get_raw_data(const uint16_t *src, size_t src_count,
-                              uint16_t *out, size_t out_count)
+/* Phase-5 (C-9, C-10, H-modbus-initial-state):
+ *   - Пред-обнуление out в самом начале: caller никогда не получает мусор
+ *     даже на ошибочных путях.
+ *   - Короткий таймаут лока (MB_GETTER_LOCK_TIMEOUT_MS = 50мс): readers
+ *     не висят при зависании poll task'а.
+ *   - Проверка first_poll_done: пока не было первого УСПЕШНОГО ответа,
+ *     возвращаем ESP_ERR_INVALID_STATE — caller не должен трактовать
+ *     нули как валидные данные.
+ *   - На таймаут лока — ESP_ERR_TIMEOUT.
+ *   - На неизвестный CID — ESP_ERR_NOT_FOUND.
+ */
+
+/* Найти запись опроса по CID. Не требует лока — таблица read-only. */
+static poll_entry_t *find_entry_by_cid(modbus_cid_t cid)
 {
-    if (out == NULL || out_count < src_count) {
+    for (size_t i = 0; i < POLL_TABLE_SIZE; i++) {
+        if (s_poll_table[i].cid == cid) {
+            return &s_poll_table[i];
+        }
+    }
+    return NULL;
+}
+
+static esp_err_t get_raw_data_by_cid(modbus_cid_t cid, uint16_t *out, size_t out_count)
+{
+    poll_entry_t *entry = find_entry_by_cid(cid);
+    if (entry == NULL) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (out == NULL || out_count < entry->reg_count) {
         return ESP_ERR_INVALID_SIZE;
     }
-    xSemaphoreTake(s_data_mutex, portMAX_DELAY);
-    memcpy(out, src, src_count * sizeof(uint16_t));
-    xSemaphoreGive(s_data_mutex);
+
+    /* C-10: out зануляется ДО любых проверок состояния — на любом
+     * ошибочном выходе caller получит чистый буфер, а не стек. */
+    memset(out, 0, out_count * sizeof(uint16_t));
+
+    if (!data_lock_timeout("get_raw", MB_GETTER_LOCK_TIMEOUT_MS, false)) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    /* H-modbus-initial-state: до первого успешного опроса данных нет. */
+    if (!entry->first_poll_done) {
+        data_unlock();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    memcpy(out, entry->data_buf, entry->reg_count * sizeof(uint16_t));
+    data_unlock();
     return ESP_OK;
 }
 
 esp_err_t modbus_poller_get_ai_raw(uint16_t *out, size_t count)
 {
-    return get_raw_data(s_ai_data, CID_AI_REG_COUNT, out, count);
+    return get_raw_data_by_cid(CID_AI_CHANNELS, out, count);
 }
 
 esp_err_t modbus_poller_get_flow_raw(uint16_t *out, size_t count)
 {
-    return get_raw_data(s_flow_data, CID_FLOW_RATE_REG_COUNT, out, count);
+    return get_raw_data_by_cid(CID_FLOW_RATES, out, count);
 }
 
 esp_err_t modbus_poller_get_volume_raw(uint16_t *out, size_t count)
 {
-    return get_raw_data(s_volume_data, CID_FLOW_VOL_REG_COUNT, out, count);
+    return get_raw_data_by_cid(CID_FLOW_VOLUMES, out, count);
 }
 
 esp_err_t modbus_poller_get_cond10_raw(uint16_t *out, size_t count)
 {
-    return get_raw_data(s_cond10_data, CID_COND10_REG_COUNT, out, count);
+    return get_raw_data_by_cid(CID_COND_ADDR10, out, count);
 }
 
 esp_err_t modbus_poller_get_cond11_raw(uint16_t *out, size_t count)
 {
-    return get_raw_data(s_cond11_data, CID_COND11_REG_COUNT, out, count);
+    return get_raw_data_by_cid(CID_COND_ADDR11, out, count);
+}
+
+esp_err_t modbus_poller_get_kws_lp_raw(uint16_t *out, size_t count)
+{
+    return get_raw_data_by_cid(CID_KWS_PUMP_LP, out, count);
+}
+
+esp_err_t modbus_poller_get_kws_hp_raw(uint16_t *out, size_t count)
+{
+    return get_raw_data_by_cid(CID_KWS_PUMP_HP, out, count);
 }
 
 /* --- Статус устройств --- */
 
 bool modbus_poller_is_device_online(uint8_t slave_addr)
 {
+    /* C-9/C-10: операции под локом, на таймаут — false (не online).
+     * H-modbus-initial-state: устройство, по которому ещё не было ни
+     * одного успешного опроса, считается offline — иначе caller примет
+     * стартовые нули за «всё в порядке».
+     *
+     * Логика: устройство online <=> найдено в таблице И существует
+     * хотя бы одна запись с first_poll_done==true И max(error_count)
+     * по записям с first_poll_done < THRESHOLD. */
+    if (!data_lock_timeout("is_online", MB_GETTER_LOCK_TIMEOUT_MS, false)) {
+        return false;
+    }
+    bool any_polled = false;
     uint32_t max_errors = 0;
     bool found = false;
-    for (int i = 0; i < POLL_TABLE_SIZE; i++) {
+    for (size_t i = 0; i < POLL_TABLE_SIZE; i++) {
         if (s_poll_table[i].slave_addr == slave_addr) {
             found = true;
-            if (s_poll_table[i].error_count > max_errors) {
-                max_errors = s_poll_table[i].error_count;
+            if (s_poll_table[i].first_poll_done) {
+                any_polled = true;
+                if (s_poll_table[i].error_count > max_errors) {
+                    max_errors = s_poll_table[i].error_count;
+                }
             }
         }
     }
-    if (!found) {
+    data_unlock();
+    if (!found || !any_polled) {
         return false;
     }
     return max_errors < DEVICE_OFFLINE_THRESHOLD;
@@ -331,13 +550,108 @@ bool modbus_poller_is_device_online(uint8_t slave_addr)
 
 uint32_t modbus_poller_get_error_count(uint8_t slave_addr)
 {
+    /* C-9: чтение под локом. На таймаут / отсутствие устройства /
+     * до первого опроса — возвращаем 0 (нет данных об ошибках). */
+    if (!data_lock_timeout("get_errors", MB_GETTER_LOCK_TIMEOUT_MS, false)) {
+        return 0;
+    }
     uint32_t max_errors = 0;
-    for (int i = 0; i < POLL_TABLE_SIZE; i++) {
-        if (s_poll_table[i].slave_addr == slave_addr) {
+    for (size_t i = 0; i < POLL_TABLE_SIZE; i++) {
+        if (s_poll_table[i].slave_addr == slave_addr &&
+            s_poll_table[i].first_poll_done) {
             if (s_poll_table[i].error_count > max_errors) {
                 max_errors = s_poll_table[i].error_count;
             }
         }
     }
+    data_unlock();
     return max_errors;
+}
+
+size_t modbus_poller_get_slave_addrs(uint8_t *out, size_t max_cnt)
+{
+    if (out == NULL || max_cnt == 0) return 0;
+    /* C-10: занулить буфер до любых ошибочных выходов. */
+    memset(out, 0, max_cnt * sizeof(uint8_t));
+
+    /* Таблица s_poll_table[].slave_addr задана статически и неизменна
+     * после init — лок не нужен. Но для единообразия с C-9 берём короткий
+     * лок: на таймаут возвращаем 0 устройств. */
+    if (!data_lock_timeout("get_addrs", MB_GETTER_LOCK_TIMEOUT_MS, false)) {
+        return 0;
+    }
+    size_t n = 0;
+    for (size_t i = 0; i < POLL_TABLE_SIZE && n < max_cnt; i++) {
+        uint8_t a = s_poll_table[i].slave_addr;
+        /* Дедупликация: один slave может опрашиваться несколькими CID */
+        bool dup = false;
+        for (size_t k = 0; k < n; k++) {
+            if (out[k] == a) { dup = true; break; }
+        }
+        if (!dup) out[n++] = a;
+    }
+    data_unlock();
+    return n;
+}
+
+/* --- Однократные holding read/write через esp-modbus low-level API ---
+ *
+ * Для health-check'а нам нужно ходить в регистры устройства, не входящие в
+ * циклический опрос (FW version, channel modes, device addr). esp-modbus v2
+ * предоставляет mbc_master_send_request() — синхронный запрос с
+ * сериализацией доступа к шине внутри стека, поэтому брать s_data_mutex не
+ * требуется. Регистры передаются массивом uint16_t в host-endian, библиотека
+ * сама делает byte-swap при формировании PDU. */
+
+esp_err_t modbus_poller_read_holding(uint8_t slave, uint16_t addr,
+                                     uint16_t *out, size_t count)
+{
+    if (out == NULL || count == 0 || count > 125) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_master_ctx == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    mb_param_request_t req = {
+        .slave_addr = slave,
+        .command    = MB_FC_READ_HOLDING_REGISTER,
+        .reg_start  = addr,
+        .reg_size   = (uint16_t)count,
+    };
+    esp_err_t err = mbc_master_send_request(s_master_ctx, &req, out);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "read_holding slave=%d addr=0x%04X cnt=%u: %s",
+                 slave, addr, (unsigned)count, esp_err_to_name(err));
+    }
+    return err;
+}
+
+esp_err_t modbus_poller_write_holding(uint8_t slave, uint16_t addr,
+                                      const uint16_t *data, size_t count)
+{
+    if (data == NULL || count == 0 || count > 123) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_master_ctx == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    /* Phase: при count==1 используем FC 0x06 — он короче в эфире и не
+     * требует префикса byte-count. Остальные счётчики идут через 0x10. */
+    mb_param_request_t req = {
+        .slave_addr = slave,
+        .command    = (count == 1) ? MB_FC_WRITE_REGISTER
+                                   : MB_FC_WRITE_MULTIPLE_REGISTERS,
+        .reg_start  = addr,
+        .reg_size   = (uint16_t)count,
+    };
+    /* esp-modbus принимает не-const void*; const-cast безопасен — функция
+     * только читает буфер для FC 0x06/0x10. */
+    esp_err_t err = mbc_master_send_request(s_master_ctx, &req, (void *)data);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "write_holding slave=%d addr=0x%04X cnt=%u: %s",
+                 slave, addr, (unsigned)count, esp_err_to_name(err));
+    }
+    return err;
 }

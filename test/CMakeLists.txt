@@ -61,6 +61,26 @@ target_include_directories(mock_interlocks_lib PUBLIC
     ${COMPONENT_INCLUDES}
 )
 
+# Phase-5: mock_power_meter — отдельно, т.к. конфликтует с реальным power_meter.c
+# (test_power_meter линкует настоящий драйвер через mocks_drivers).
+add_library(mock_power_meter_lib STATIC mocks/mock_power_meter.c)
+target_include_directories(mock_power_meter_lib PUBLIC
+    ${STUB_INCLUDES}
+    ${COMPONENT_INCLUDES}
+)
+
+# Phase-3 (L-5): минимальный набор моков для тестирования настоящих драйверов
+# (без мок-замен driver-уровня; вместо этого мокируется modbus_poller).
+add_library(mocks_drivers STATIC
+    mocks/mock_esp_timer.c
+    mocks/mock_hal_nvs.c
+    mocks/mock_modbus_poller.c
+)
+target_include_directories(mocks_drivers PUBLIC
+    ${STUB_INCLUDES}
+    ${COMPONENT_INCLUDES}
+)
+
 # ===========================================
 # Опции компиляции
 # ===========================================
@@ -115,10 +135,10 @@ add_host_test(test_doser
     LIBS mocks_core mock_config
 )
 
-# 3. test_state_machine: real state_machine.c + alarm_manager.c + mocks_core + mock_config + mock_interlocks
+# 3. test_state_machine: real state_machine.c + alarm_manager.c + mocks_core + mock_config + mock_interlocks + mock_power_meter (Phase-5)
 add_host_test(test_state_machine
     SRCS test_state_machine.c "${COMP_DIR}/process/state_machine.c" "${COMP_DIR}/services/alarm_manager.c"
-    LIBS mocks_core mock_config mock_interlocks_lib
+    LIBS mocks_core mock_config mock_interlocks_lib mock_power_meter_lib
 )
 
 # 4. test_alarm_manager: real alarm_manager.c + mocks_core
@@ -137,4 +157,42 @@ add_host_test(test_telemetry
 add_host_test(test_config_manager
     SRCS test_config_manager.c "${COMP_DIR}/services/config_manager.c"
     LIBS mocks_core
+)
+
+# Phase-3 (L-5): тесты драйверов с моком modbus_poller'а
+
+# 7. test_flowmeter: real flowmeter.c + mocks_drivers (с mock_modbus_poller)
+add_host_test(test_flowmeter
+    SRCS test_flowmeter.c "${COMP_DIR}/drivers/flowmeter.c"
+    LIBS mocks_drivers
+)
+
+# 8. test_conductivity: real conductivity.c
+add_host_test(test_conductivity
+    SRCS test_conductivity.c "${COMP_DIR}/drivers/conductivity.c"
+    LIBS mocks_drivers
+)
+
+# 9. test_analog_input: real analog_input.c
+add_host_test(test_analog_input
+    SRCS test_analog_input.c "${COMP_DIR}/drivers/analog_input.c"
+    LIBS mocks_drivers
+)
+
+# 10. test_power_meter: real power_meter.c (KWS-306L) + mocks_drivers
+add_host_test(test_power_meter
+    SRCS test_power_meter.c "${COMP_DIR}/drivers/power_meter.c"
+    LIBS mocks_drivers
+)
+
+# 11. test_mb_device_check: real mb_device_check.c + все драйверы + alarm_manager
+# (проверяет автокоррекцию AI mode и sanity-проверки sensors).
+add_host_test(test_mb_device_check
+    SRCS test_mb_device_check.c
+         "${COMP_DIR}/drivers/mb_device_check.c"
+         "${COMP_DIR}/drivers/flowmeter.c"
+         "${COMP_DIR}/drivers/conductivity.c"
+         "${COMP_DIR}/drivers/power_meter.c"
+         "${COMP_DIR}/services/alarm_manager.c"
+    LIBS mocks_drivers
 )

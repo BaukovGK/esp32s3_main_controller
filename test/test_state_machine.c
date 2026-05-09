@@ -16,6 +16,7 @@
 #include "mock_analog_input.h"
 #include "mock_interlocks.h"
 #include "mock_hal_nvs.h"
+#include "mock_power_meter.h"
 #include "analog_input.h"
 #include "alarm_manager.h"
 
@@ -27,6 +28,7 @@ void setUp(void)
     mock_config_set_defaults();
     mock_analog_reset();
     mock_interlocks_reset();
+    mock_pm_reset();  /* Phase-5: KWS оба offline по умолчанию (геттеры NaN) */
 
     /* alarm_manager нужен для state_machine (MANUAL dep warnings) */
     alarm_manager_init();
@@ -355,6 +357,51 @@ void test_sm_washing_full_cycle(void)
     TEST_ASSERT_EQUAL(SM_IDLE, state_machine_get_state());
 }
 
+/* === Phase-2 (K-4): persistence из NVS === */
+
+#include "hal_nvs.h"  /* для прямой записи в mock NVS */
+
+/* После «перезагрузки» в FAULT — SM должен восстановить FAULT с теми же flags */
+void test_sm_persistence_restores_fault(void)
+{
+    /* Симулируем «прошлый запуск»: записываем FAULT в NVS */
+    hal_nvs_set_i32("sm_state", (int32_t)SM_FAULT);
+    hal_nvs_set_i32("sm_fault", (int32_t)0x1234);
+
+    /* Заново инициализируем SM (имитация рестарта) */
+    state_machine_init();
+
+    sm_status_t st = state_machine_get_status();
+    TEST_ASSERT_EQUAL(SM_FAULT, st.state);
+    TEST_ASSERT_EQUAL_HEX32(0x1234, st.fault_flags);
+}
+
+/* После «перезагрузки» во время AUTO — SM входит в FAULT с флагом UNEXPECTED_RESTART */
+void test_sm_persistence_unexpected_restart_during_auto(void)
+{
+    hal_nvs_set_i32("sm_state", (int32_t)SM_AUTO);
+    hal_nvs_set_i32("sm_fault", 0);
+
+    state_machine_init();
+
+    sm_status_t st = state_machine_get_status();
+    TEST_ASSERT_EQUAL(SM_FAULT, st.state);
+    TEST_ASSERT_TRUE(st.fault_flags & INTERLOCK_UNEXPECTED_RESTART);
+}
+
+/* После нормального останова (IDLE) — SM стартует чисто */
+void test_sm_persistence_clean_start_after_idle(void)
+{
+    hal_nvs_set_i32("sm_state", (int32_t)SM_IDLE);
+    hal_nvs_set_i32("sm_fault", 0);
+
+    state_machine_init();
+
+    sm_status_t st = state_machine_get_status();
+    TEST_ASSERT_EQUAL(SM_IDLE, st.state);
+    TEST_ASSERT_EQUAL(0, st.fault_flags);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
@@ -369,5 +416,8 @@ int main(void)
     RUN_TEST(test_sm_washing_overheat_fault);
     RUN_TEST(test_sm_washing_supply_duration);
     RUN_TEST(test_sm_washing_full_cycle);
+    RUN_TEST(test_sm_persistence_restores_fault);
+    RUN_TEST(test_sm_persistence_unexpected_restart_during_auto);
+    RUN_TEST(test_sm_persistence_clean_start_after_idle);
     return UNITY_END();
 }

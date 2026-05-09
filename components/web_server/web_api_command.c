@@ -10,6 +10,8 @@
 #include "doser.h"
 #include "config_manager.h"
 #include "mqtt_app.h"
+#include "hal_buzzer.h"
+#include "web_auth.h"
 
 #include <string.h>
 
@@ -37,6 +39,12 @@ static esp_err_t send_error(httpd_req_t *req, int status, const char *msg)
 
 static cJSON *recv_json(httpd_req_t *req)
 {
+    /* Phase-4 (H-13): auth-проверка для всех POST-команд (управление + конфиг).
+     * При выкл. auth (пустой username в config) — пропускает без проверки. */
+    if (!web_auth_check(req)) {
+        return NULL;  /* web_auth_check уже отправил 401 */
+    }
+
     int total = req->content_len;
     if (total <= 0 || total > MAX_POST_SIZE) {
         send_error(req, 400, "invalid body size");
@@ -93,10 +101,23 @@ static esp_err_t command_post_handler(httpd_req_t *req)
     return send_ok(req);
 }
 
+/* ===== POST /api/v1/silence (Phase-4) =====
+ * Глушит buzzer до следующего изменения списка аварий.
+ * Альтернатива аппаратной кнопке silence (на плате нет свободных DI).
+ */
+static esp_err_t silence_post_handler(httpd_req_t *req)
+{
+    if (!web_auth_check(req)) return ESP_OK;
+    ESP_LOGI(TAG, "Silence buzzer");
+    hal_buzzer_silence();
+    return send_ok(req);
+}
+
 /* ===== POST /api/v1/manual/do ===== */
 
 static esp_err_t manual_do_post_handler(httpd_req_t *req)
 {
+    if (!web_auth_check(req)) return ESP_OK;
     if (state_machine_get_state() != SM_MANUAL) {
         return send_error(req, 409, "not in MANUAL mode");
     }
@@ -283,14 +304,44 @@ static esp_err_t config_mqtt_post_handler(httpd_req_t *req)
     return send_ok(req);
 }
 
+/* ===== POST /api/v1/config/web_auth (Phase-4, H-13) =====
+ * Включение / отключение Basic Auth. Пустой username = выкл.
+ * После применения вызывает web_auth_refresh() — кэш пересчитается.
+ */
+static esp_err_t config_web_auth_post_handler(httpd_req_t *req)
+{
+    cJSON *root = recv_json(req);
+    if (!root) return ESP_OK;
+
+    config_web_auth_t cfg = config_manager_get()->web_auth;
+
+    cJSON *j;
+    if ((j = cJSON_GetObjectItem(root, "username")) && cJSON_IsString(j)) {
+        strncpy(cfg.username, j->valuestring, sizeof(cfg.username) - 1);
+        cfg.username[sizeof(cfg.username) - 1] = '\0';
+    }
+    if ((j = cJSON_GetObjectItem(root, "password")) && cJSON_IsString(j)) {
+        strncpy(cfg.password, j->valuestring, sizeof(cfg.password) - 1);
+        cfg.password[sizeof(cfg.password) - 1] = '\0';
+    }
+
+    config_manager_set_web_auth(&cfg);
+    web_auth_refresh();  /* пересчёт кэша b64 */
+
+    cJSON_Delete(root);
+    return send_ok(req);
+}
+
 /* ===== Регистрация ===== */
 
 void web_api_register_commands(httpd_handle_t server)
 {
     static const httpd_uri_t uris[] = {
         {"/api/v1/command",          HTTP_POST, command_post_handler, NULL},
+        {"/api/v1/silence",          HTTP_POST, silence_post_handler, NULL},
         {"/api/v1/manual/do",        HTTP_POST, manual_do_post_handler, NULL},
         {"/api/v1/doser/enable",     HTTP_POST, doser_enable_post_handler, NULL},
+        {"/api/v1/config/web_auth",  HTTP_POST, config_web_auth_post_handler, NULL},
         {"/api/v1/config/pressure",  HTTP_POST, config_pressure_post_handler, NULL},
         {"/api/v1/config/doser",     HTTP_POST, config_doser_post_handler, NULL},
         {"/api/v1/config/washing",   HTTP_POST, config_washing_post_handler, NULL},

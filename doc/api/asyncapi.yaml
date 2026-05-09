@@ -1,0 +1,813 @@
+asyncapi: '2.6.0'
+info:
+  title: RO Plant Controller — MQTT API
+  version: '1.0.0'
+  description: |
+    MQTT-API контроллера установки обратного осмоса (ESP32-S3, ESP-IDF 5.4.4).
+
+    Все топики имеют префикс `ro_plant/` (за исключением Home Assistant
+    Discovery — `homeassistant/...`). Direction в спецификации указан
+    с точки зрения **контроллера**:
+
+      * `publish`   — топики, которые публикует контроллер;
+      * `subscribe` — топики, на которые контроллер подписан (входящие команды
+                      и обновления конфигурации).
+
+    Сводка QoS / retain (значения взяты из исходников `mqtt_publish.c` /
+    `mqtt_subscribe.c`):
+
+      | Топик                          | QoS | retain |
+      |--------------------------------|:---:|:------:|
+      | ro_plant/status/state          |  1  |   1    |
+      | ro_plant/status/io             |  0  |   0    |
+      | ro_plant/status/analog/*       |  0  |   0    |
+      | ro_plant/status/flow/*         |  0  |   0    |
+      | ro_plant/status/conductivity/* |  0  |   0    |
+      | ro_plant/status/power/*        |  0  |   0    |
+      | ro_plant/status/telemetry      |  0  |   0    |
+      | ro_plant/status/doser          |  0  |   0    |
+      | ro_plant/status/interlocks     |  0  |   0    |
+      | ro_plant/status/diagnostics    |  0  |   0    |
+      | ro_plant/alarms                |  1  |   0    |
+      | ro_plant/availability (LWT)    |  1  |   1    |
+      | homeassistant/.../config       |  1  |   1    |
+      | ro_plant/command/*             |  1  |   —    |
+      | ro_plant/settings/#            |  1  |   —    |
+
+    NaN-значения (датчик offline / fault / нет первого опроса) сериализуются
+    как JSON `null` — поля с возможным `null` помечены `nullable: true`.
+
+    Last Will (LWT): топик `ro_plant/availability` с payload `offline`,
+    QoS=1, retain=1. После успешного подключения контроллер публикует
+    `online` (см. `mqtt_publish_online`).
+  license:
+    name: Proprietary
+
+defaultContentType: application/json
+
+servers:
+  production:
+    url: '{broker_host}:{broker_port}'
+    protocol: mqtt
+    description: |
+      MQTT-брокер. Хост, порт и креды настраиваются через
+      `POST /api/v1/config/mqtt` веб-интерфейса (или MQTT топик
+      `ro_plant/settings/...` при включённой подписке).
+    variables:
+      broker_host:
+        default: '192.168.1.100'
+      broker_port:
+        default: '1883'
+
+channels:
+  # ===== STATUS =====
+  ro_plant/status/state:
+    description: |
+      Состояние state machine. Публикуется при каждом цикле публикации
+      (`publish_interval_s`, по умолчанию 5 с). Retain=1, QoS=1.
+    publish:
+      operationId: publishState
+      summary: Состояние машины состояний (SM)
+      message:
+        $ref: '#/components/messages/StateMessage'
+
+  ro_plant/status/io:
+    description: |
+      Битовые маски DI (входы) и DO (выходы) — мгновенный снимок.
+    publish:
+      operationId: publishIO
+      summary: Состояние DI/DO
+      message:
+        $ref: '#/components/messages/IOMessage'
+
+  ro_plant/status/analog/{channel}:
+    description: |
+      Аналоговый вход (давление P1..P4, температура T). Источник —
+      Waveshare AI 4-канальный modbus-модуль + 4-20мА термодатчик.
+      `value=null` пока модуль не ответил хотя бы один раз или fault=true.
+    parameters:
+      channel:
+        description: Имя канала
+        schema:
+          type: string
+          enum: [P1, P2, P3, P4, T]
+    publish:
+      operationId: publishAnalog
+      message:
+        $ref: '#/components/messages/AnalogMessage'
+
+  ro_plant/status/flow/{channel}:
+    description: |
+      Расходомер (УРЖ2КМ, 4 канала). `Q1..Q4` — мгновенный расход (м³/ч)
+      и накопленный объём (м³). `flow=null` / `volume=null` если канал
+      offline (`ok=false`).
+    parameters:
+      channel:
+        schema:
+          type: string
+          enum: [Q1, Q2, Q3, Q4]
+    publish:
+      operationId: publishFlow
+      message:
+        $ref: '#/components/messages/FlowMessage'
+
+  ro_plant/status/conductivity/{channel}:
+    description: |
+      Кондуктометр. 4 канала с 2026-05-09 (s4 = концентрат добавлен).
+
+        * s1 — питающая вода (feed)
+        * s2 — пермеат стадии 1 (perm1)
+        * s3 — пермеат стадии 2 (perm2)
+        * s4 — концентрат
+    parameters:
+      channel:
+        schema:
+          type: string
+          enum: [s1, s2, s3, s4]
+    publish:
+      operationId: publishConductivity
+      message:
+        $ref: '#/components/messages/ConductivityMessage'
+
+  ro_plant/status/power/{pump}:
+    description: |
+      Электропотребление насоса (ваттметр KWS-306L, добавлен 2026-05-09).
+
+        * lp — насос низкого давления (LP)
+        * hp — насос высокого давления (HP)
+
+      Все числовые поля могут быть `null`, если устройство offline или
+      не было первого опроса (`valid=false`).
+    parameters:
+      pump:
+        schema:
+          type: string
+          enum: [lp, hp]
+    publish:
+      operationId: publishPower
+      message:
+        $ref: '#/components/messages/PowerMessage'
+
+  ro_plant/status/telemetry:
+    description: |
+      Расчётные параметры процесса: dP фильтра, поток на ст.1, recovery,
+      селективность по стадиям. Все числа nullable (зависят от валидности
+      исходных датчиков).
+    publish:
+      operationId: publishTelemetry
+      message:
+        $ref: '#/components/messages/TelemetryMessage'
+
+  ro_plant/status/doser:
+    description: Состояние и enable-флаг дозатора.
+    publish:
+      operationId: publishDoser
+      message:
+        $ref: '#/components/messages/DoserStatusMessage'
+
+  ro_plant/status/interlocks:
+    description: |
+      Снимок интерлоков: битовая маска флагов, статус E-STOP,
+      предупреждение «забит фильтр».
+    publish:
+      operationId: publishInterlocks
+      message:
+        $ref: '#/components/messages/InterlocksMessage'
+
+  ro_plant/status/diagnostics:
+    description: |
+      Диагностическая информация: heap, uptime, стеки FreeRTOS-задач,
+      статус Modbus-устройств. Публикуется каждый N-й цикл (по умолчанию
+      ~30 с при `publish_interval_s=5`).
+    publish:
+      operationId: publishDiagnostics
+      message:
+        $ref: '#/components/messages/DiagnosticsMessage'
+
+  ro_plant/alarms:
+    description: |
+      Событие аварии (raise или clear). Публикуется по факту изменения,
+      QoS=1, retain=0. Активные аварии переопубликуются после
+      `MQTT_EVENT_CONNECTED` (re-publish snapshot).
+    publish:
+      operationId: publishAlarm
+      message:
+        $ref: '#/components/messages/AlarmMessage'
+
+  ro_plant/availability:
+    description: |
+      Availability топик (Home Assistant convention) и MQTT LWT.
+      Контроллер публикует `online` после `MQTT_EVENT_CONNECTED`.
+      LWT (`offline`) выставит брокер при потере связи, retain=1.
+    publish:
+      operationId: publishAvailability
+      message:
+        $ref: '#/components/messages/AvailabilityMessage'
+
+  # ===== HOME ASSISTANT DISCOVERY =====
+  homeassistant/sensor/ro_plant/{object_id}/config:
+    description: |
+      Home Assistant MQTT Discovery — sensor. Публикуется один раз после
+      каждого `MQTT_EVENT_CONNECTED` со списком из ~21 entity (см.
+      `s_ha_entities` в `mqtt_publish.c`). Retain=1.
+    parameters:
+      object_id:
+        description: |
+          Уникальный ID сущности. Список значений (на 2026-05-09):
+          `ro_plant_state`, `ro_plant_faults`, `ro_plant_p1`..`p4`,
+          `ro_plant_temp`, `ro_plant_q1`..`q4`, `ro_plant_s1`..`s4`,
+          `ro_plant_filter_dp`, `ro_plant_recovery`, `ro_plant_sel1/2`,
+          `ro_plant_heap`, `ro_plant_uptime_diag`.
+        schema:
+          type: string
+    publish:
+      operationId: publishHaSensorConfig
+      message:
+        $ref: '#/components/messages/HaSensorConfigMessage'
+
+  homeassistant/binary_sensor/ro_plant/{object_id}/config:
+    description: |
+      Home Assistant MQTT Discovery — binary_sensor. На 2026-05-09:
+      `ro_plant_estop`, `ro_plant_filter_warn`. Retain=1, QoS=1.
+    parameters:
+      object_id:
+        schema:
+          type: string
+    publish:
+      operationId: publishHaBinarySensorConfig
+      message:
+        $ref: '#/components/messages/HaBinarySensorConfigMessage'
+
+  # ===== COMMANDS (incoming) =====
+  ro_plant/command/mode:
+    description: |
+      Команда состояния SM. Payload — текстовая строка (НЕ JSON):
+      `start_auto` | `stop` | `start_washing` | `confirm_wash` |
+      `set_manual` | `reset_fault`. QoS подписки = 1.
+    subscribe:
+      operationId: receiveCommandMode
+      message:
+        $ref: '#/components/messages/CommandModeMessage'
+
+  ro_plant/command/pump:
+    description: |
+      Прямое управление DO в режиме MANUAL. Игнорируется, если SM не в
+      состоянии `MANUAL`.
+    subscribe:
+      operationId: receiveCommandPump
+      message:
+        $ref: '#/components/messages/CommandPumpMessage'
+
+  ro_plant/command/doser:
+    description: Включить / выключить дозатор.
+    subscribe:
+      operationId: receiveCommandDoser
+      message:
+        $ref: '#/components/messages/CommandDoserMessage'
+
+  ro_plant/command/heater:
+    description: |
+      Управление ТЭНом в режиме MANUAL. Игнорируется вне MANUAL.
+      Поле `on` переключает бит `BOARD_DO_HEATER` в маске желаемого DO.
+    subscribe:
+      operationId: receiveCommandHeater
+      message:
+        $ref: '#/components/messages/CommandHeaterMessage'
+
+  ro_plant/command/silence:
+    description: |
+      Глушит buzzer до следующего изменения списка аварий (Phase-4).
+      Payload игнорируется (можно отправлять пустой). QoS подписки = 1.
+    subscribe:
+      operationId: receiveCommandSilence
+      message:
+        $ref: '#/components/messages/CommandSilenceMessage'
+
+  ro_plant/settings/{section}:
+    description: |
+      Обновление подсекции конфигурации в рантайме. Контроллер подписан
+      на wildcard `ro_plant/settings/#`. Payload — JSON; обрабатываемые
+      секции: `pressure`, `doser`, `washing`, `timeouts`. Неизвестные
+      секции игнорируются.
+    parameters:
+      section:
+        schema:
+          type: string
+          enum: [pressure, doser, washing, timeouts]
+    subscribe:
+      operationId: receiveSettingsUpdate
+      message:
+        oneOf:
+          - $ref: '#/components/messages/SettingsPressureMessage'
+          - $ref: '#/components/messages/SettingsDoserMessage'
+          - $ref: '#/components/messages/SettingsWashingMessage'
+          - $ref: '#/components/messages/SettingsTimeoutsMessage'
+
+components:
+  messages:
+    StateMessage:
+      name: StateMessage
+      title: SM state snapshot
+      contentType: application/json
+      payload:
+        type: object
+        required: [state, fault_flags]
+        properties:
+          state:
+            type: string
+            enum: [IDLE, AUTO, WASHING, MANUAL, FAULT]
+            description: Текущее состояние верхнего уровня
+          auto_sub:
+            type: string
+            nullable: true
+            enum:
+              - STARTING_PUMP1
+              - RAMP
+              - STARTING_PUMP2
+              - FILLING_INTERM
+              - STARTING_PUMP3
+              - RUNNING
+              - STOPPING
+            description: Подсостояние AUTO (null если state ≠ AUTO)
+          wash_sub:
+            type: string
+            nullable: true
+            enum:
+              - WAIT_HEAT
+              - HEATING
+              - WAIT_SUPPLY
+              - SUPPLY
+              - WAIT_DRAIN
+              - DRAIN
+              - DONE
+            description: Подсостояние WASHING (null если state ≠ WASHING)
+          fault_flags:
+            type: integer
+            format: uint32
+            description: Битовая маска interlock-причин входа в FAULT
+
+    IOMessage:
+      name: IOMessage
+      payload:
+        type: object
+        required: [di, do]
+        properties:
+          di:
+            type: integer
+            minimum: 0
+            maximum: 255
+            description: Битовая маска DI (8 бит)
+          do:
+            type: integer
+            minimum: 0
+            maximum: 255
+            description: Битовая маска DO (фактическое состояние, readback)
+
+    AnalogMessage:
+      name: AnalogMessage
+      payload:
+        type: object
+        required: [value, unit, fault]
+        properties:
+          value:
+            type: number
+            format: float
+            nullable: true
+            description: |
+              Измеренное значение. `null` если канал не валиден
+              (нет первого опроса или fault=true).
+          unit:
+            type: string
+            enum: [bar, C]
+            description: Единица измерения (для P*=bar, для T=C)
+          fault:
+            type: boolean
+            description: Аппаратный fault канала (обрыв 4-20мА и т.п.)
+
+    FlowMessage:
+      name: FlowMessage
+      payload:
+        type: object
+        required: [flow, volume, ok]
+        properties:
+          flow:
+            type: number
+            format: float
+            nullable: true
+            description: Мгновенный расход, м³/ч (null при ok=false)
+          volume:
+            type: number
+            format: float
+            nullable: true
+            description: Накопленный объём, м³ (null при ok=false)
+          ok:
+            type: boolean
+            description: Канал отвечает (online + первый опрос прошёл)
+
+    ConductivityMessage:
+      name: ConductivityMessage
+      payload:
+        type: object
+        required: [conductivity, temperature, ok]
+        properties:
+          conductivity:
+            type: number
+            format: float
+            nullable: true
+            description: Удельная электропроводность, мкСм/см
+          temperature:
+            type: number
+            format: float
+            nullable: true
+            description: Температура измерения, °C
+          ok:
+            type: boolean
+
+    PowerMessage:
+      name: PowerMessage
+      title: KWS-306L power-meter snapshot
+      payload:
+        type: object
+        required: [voltage, current, power, energy, temperature, online]
+        properties:
+          voltage:
+            type: number
+            format: float
+            nullable: true
+            description: Напряжение, В
+          current:
+            type: number
+            format: float
+            nullable: true
+            description: Ток, А
+          power:
+            type: number
+            format: float
+            nullable: true
+            description: Активная мощность, Вт
+          energy:
+            type: number
+            format: float
+            nullable: true
+            description: Накопленная энергия, кВт·ч
+          temperature:
+            type: number
+            format: float
+            nullable: true
+            description: Температура счётчика, °C
+          online:
+            type: boolean
+            description: Modbus-устройство онлайн
+
+    TelemetryMessage:
+      name: TelemetryMessage
+      payload:
+        type: object
+        properties:
+          filter_dp:
+            type: number
+            format: float
+            nullable: true
+            description: Перепад на префильтре (P1−P2), бар
+          stage1_feed:
+            type: number
+            format: float
+            nullable: true
+            description: Поток питания на ст.1, м³/ч
+          recovery2:
+            type: number
+            format: float
+            nullable: true
+            description: Recovery стадии 2, %
+          recovery_sys:
+            type: number
+            format: float
+            nullable: true
+            description: Системный recovery, %
+          sel1:
+            type: number
+            format: float
+            nullable: true
+            description: Селективность ст.1, %
+          sel2:
+            type: number
+            format: float
+            nullable: true
+            description: Селективность ст.2, %
+
+    DoserStatusMessage:
+      name: DoserStatusMessage
+      payload:
+        type: object
+        required: [state, enabled]
+        properties:
+          state:
+            type: string
+            enum: [OFF, RUNNING, PAUSE, UNKNOWN]
+          enabled:
+            type: boolean
+
+    InterlocksMessage:
+      name: InterlocksMessage
+      payload:
+        type: object
+        required: [flags, estop, filter_warn]
+        properties:
+          flags:
+            type: integer
+            format: uint32
+            description: Битовая маска активных interlock-причин
+          estop:
+            type: boolean
+            description: E-STOP физически нажат
+          filter_warn:
+            type: boolean
+            description: Перепад фильтра выше `filter_dp_warn`
+
+    DiagnosticsMessage:
+      name: DiagnosticsMessage
+      payload:
+        type: object
+        required: [heap_free, heap_min, uptime_s, modbus]
+        properties:
+          heap_free:
+            type: integer
+            description: Свободный heap, байт
+          heap_min:
+            type: integer
+            description: Минимум heap за всю работу, байт
+          uptime_s:
+            type: integer
+            description: Uptime, секунд
+          stack:
+            type: object
+            additionalProperties:
+              type: integer
+            description: |
+              Свободный стек по задачам (имя → байт). Имена задач
+              регистрируются через `diagnostics_register_task()`.
+          modbus:
+            type: array
+            description: Состояние Modbus-устройств (динамический список)
+            items:
+              type: object
+              required: [addr, errors, online]
+              properties:
+                addr:
+                  type: integer
+                  description: Slave-адрес
+                errors:
+                  type: integer
+                  description: Накопленный счётчик ошибок
+                online:
+                  type: boolean
+          wdt_stale:
+            type: integer
+            description: Заглушка (всегда 0 на 2026-05-09)
+
+    AlarmMessage:
+      name: AlarmMessage
+      payload:
+        type: object
+        required: [id, ts, cat, code, value, active]
+        properties:
+          id:
+            type: integer
+            description: Порядковый номер записи
+          ts:
+            type: integer
+            description: Timestamp события (uptime-секунды)
+          cat:
+            type: string
+            enum: [CRITICAL, ALARM, WARNING, INFO, UNKNOWN]
+          code:
+            type: string
+            description: Краткое имя кода аварии
+            enum:
+              - ESTOP
+              - SOURCE_EMPTY
+              - INTERM_EMPTY
+              - P1_HIGH
+              - P3_HIGH
+              - P4_HIGH
+              - T_HIGH
+              - FILTER_DP
+              - PUMP1_TIMEOUT
+              - PUMP2_TIMEOUT
+              - PUMP3_TIMEOUT
+              - SENSOR_P1
+              - SENSOR_P2
+              - SENSOR_P3
+              - SENSOR_P4
+              - SENSOR_T
+              - MQTT_DISC
+              - MODBUS_OFF
+              - STATE_CHG
+              - FAULT_RST
+              - MANUAL_DEP
+              - SYS_START
+              - DO_READBACK
+              - I2C_HUNG
+              - MB_LOCK_HUNG
+              - UNEXP_RST
+              - RST_DURING_OP
+              - STEP_TIMEOUT
+              - LOW_HEAP
+              - UNKNOWN
+          value:
+            type: number
+            format: float
+            description: |
+              Сопровождающее число (трактовка зависит от кода:
+              для MODBUS_OFF — slave addr; для STEP_TIMEOUT —
+              auto_substate; для LOW_HEAP — свободные байты).
+          active:
+            type: boolean
+            description: true = raise, false = clear
+
+    AvailabilityMessage:
+      name: AvailabilityMessage
+      contentType: text/plain
+      payload:
+        type: string
+        enum: [online, offline]
+
+    HaSensorConfigMessage:
+      name: HaSensorConfigMessage
+      title: HA Discovery sensor payload
+      summary: |
+        JSON конфигурации HA-сущности sensor (см. cJSON в
+        `mqtt_publish_ha_discovery`). Дополнительные ключи (icon,
+        device_class, unit_of_measurement) присутствуют опционально.
+      payload:
+        type: object
+        required: [name, unique_id, state_topic, value_template, availability_topic, device]
+        properties:
+          name:
+            type: string
+          unique_id:
+            type: string
+          state_topic:
+            type: string
+            description: Один из `ro_plant/status/...`
+          value_template:
+            type: string
+            description: Jinja-шаблон для извлечения значения из JSON
+          availability_topic:
+            type: string
+            example: ro_plant/availability
+          unit_of_measurement:
+            type: string
+          device_class:
+            type: string
+          icon:
+            type: string
+          device:
+            $ref: '#/components/schemas/HaDeviceObj'
+
+    HaBinarySensorConfigMessage:
+      name: HaBinarySensorConfigMessage
+      title: HA Discovery binary_sensor payload
+      payload:
+        type: object
+        required: [name, unique_id, state_topic, value_template, availability_topic,
+                   payload_on, payload_off, device]
+        properties:
+          name: { type: string }
+          unique_id: { type: string }
+          state_topic: { type: string }
+          value_template: { type: string }
+          availability_topic: { type: string }
+          device_class: { type: string }
+          icon: { type: string }
+          payload_on:
+            type: string
+            example: 'true'
+          payload_off:
+            type: string
+            example: 'false'
+          device:
+            $ref: '#/components/schemas/HaDeviceObj'
+
+    CommandModeMessage:
+      name: CommandModeMessage
+      contentType: text/plain
+      summary: |
+        Полезная нагрузка — текстовая строка без кавычек, без JSON.
+      payload:
+        type: string
+        enum:
+          - start_auto
+          - stop
+          - start_washing
+          - confirm_wash
+          - set_manual
+          - reset_fault
+
+    CommandPumpMessage:
+      name: CommandPumpMessage
+      payload:
+        type: object
+        required: [mask]
+        properties:
+          mask:
+            type: integer
+            minimum: 0
+            maximum: 255
+            description: |
+              Битовая маска DO в режиме MANUAL (бит 0 = RO1).
+              Игнорируется вне MANUAL.
+
+    CommandDoserMessage:
+      name: CommandDoserMessage
+      payload:
+        type: object
+        required: [enabled]
+        properties:
+          enabled:
+            type: boolean
+
+    CommandHeaterMessage:
+      name: CommandHeaterMessage
+      payload:
+        type: object
+        required: [on]
+        properties:
+          on:
+            type: boolean
+            description: |
+              true → включить ТЭН (set bit BOARD_DO_HEATER в желаемой
+              маске MANUAL), false → выключить.
+
+    CommandSilenceMessage:
+      name: CommandSilenceMessage
+      contentType: text/plain
+      summary: |
+        Любой payload (обычно пустой). Эффект — `hal_buzzer_silence()`.
+      payload:
+        type: string
+
+    SettingsPressureMessage:
+      name: SettingsPressureMessage
+      summary: 'Подтопик: ro_plant/settings/pressure'
+      payload:
+        type: object
+        properties:
+          p1_max: { type: number, format: float }
+          p3_max: { type: number, format: float }
+          p4_max: { type: number, format: float }
+          filter_dp_warn: { type: number, format: float }
+
+    SettingsDoserMessage:
+      name: SettingsDoserMessage
+      summary: 'Подтопик: ro_plant/settings/doser'
+      payload:
+        type: object
+        properties:
+          run_time_min: { type: integer }
+          cycle_time_min: { type: integer }
+
+    SettingsWashingMessage:
+      name: SettingsWashingMessage
+      summary: 'Подтопик: ro_plant/settings/washing'
+      payload:
+        type: object
+        properties:
+          target_temp_C: { type: number, format: float }
+          max_temp_C: { type: number, format: float }
+          t_overshoot_C: { type: number, format: float }
+          hysteresis_C: { type: number, format: float }
+          heat_timeout_min: { type: integer }
+          supply_time_min: { type: integer }
+          drain_time_min: { type: integer }
+
+    SettingsTimeoutsMessage:
+      name: SettingsTimeoutsMessage
+      summary: 'Подтопик: ro_plant/settings/timeouts'
+      payload:
+        type: object
+        properties:
+          pump_confirm_ms: { type: integer }
+          pump_ramp_ms: { type: integer }
+
+  schemas:
+    HaDeviceObj:
+      type: object
+      required: [identifiers, name, manufacturer, model, sw_version]
+      properties:
+        identifiers:
+          type: array
+          items: { type: string }
+          example: ['ro_plant_001']
+        name:
+          type: string
+          example: 'RO Plant Controller'
+        manufacturer:
+          type: string
+          example: 'Custom'
+        model:
+          type: string
+          example: 'ESP32-S3 RO'
+        sw_version:
+          type: string
+          example: '1.0.0'

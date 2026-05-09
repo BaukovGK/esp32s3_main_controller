@@ -59,6 +59,7 @@
 | `MQTT_DIAG_CYCLE` | `6` | Частота публикации диагностики: каждый N-й цикл основного цикла задачи (при интервале 5 с -- примерно каждые 30 с). |
 | `MQTT_RECONNECT_MS` | `5000` | Таймаут переподключения MQTT-клиента (в миллисекундах). Передаётся в `network.reconnect_timeout_ms` конфигурации ESP-IDF MQTT. |
 | `MQTT_LWT_MSG` | `"offline"` | Текст LWT-сообщения. Публикуется брокером при разрыве соединения. Длина вычисляется как `sizeof(MQTT_LWT_MSG) - 1`. |
+| `MQTT_REPUBLISH_MAX_ALARMS` | `32` | Phase-4 (C-4): размер локального буфера для перепубликации активных аварий после reconnect. Совпадает с `MAX_ACTIVE` в `alarm_manager.c`. |
 
 ---
 
@@ -189,12 +190,18 @@ esp_err_t mqtt_app_reconnect(void);
 
 **Описание:**
 Переподключение MQTT-клиента с новыми настройками. Выполняет последовательно:
-1. `mqtt_app_stop()` -- полная остановка текущего клиента.
-2. `mqtt_app_start()` -- создание и запуск нового клиента с текущей конфигурацией из `config_manager`.
+1. `mqtt_app_stop_locked()` -- полная остановка текущего клиента.
+2. `mqtt_app_start_locked()` -- создание и запуск нового клиента с текущей конфигурацией из `config_manager`.
+
+**Phase-2 (H-6, потокобезопасность):** весь stop+start выполняется под единым mutex'ом `s_lifecycle_lock`. Раньше два параллельных POST-запроса `/api/v1/config/mqtt` приводили к двойному `esp_mqtt_client_destroy()` → краху прошивки. Теперь второй вызов ждёт до 5 секунд завершения первого.
+
+`mqtt_app_start()` и `mqtt_app_stop()` (публичные) тоже захватывают `s_lifecycle_lock` — внутренняя реализация вынесена в `*_locked` варианты, чтобы `mqtt_app_reconnect()` мог выполнить stop+start под одним lock'ом без двойного захвата.
 
 **Параметры:** нет.
 
-**Возвращаемое значение:** аналогично `mqtt_app_start()`.
+**Возвращаемое значение:**
+- Аналогично `mqtt_app_start()`,
+- `ESP_ERR_TIMEOUT` если другой stop/start/reconnect выполняется > 5 секунд.
 
 **Применение:** вызывается при изменении MQTT-настроек через Web UI или другой интерфейс.
 
@@ -228,6 +235,23 @@ Callback-функция, регистрируемая в `alarm_manager`. Выз
 
 ---
 
+#### `republish_active_alarms` (Phase-4, C-4)
+
+```c
+static void republish_active_alarms(void);
+```
+
+**Описание:**
+Снапшот всех активных аварий из `alarm_manager` через `alarm_get_active()` и повторная публикация каждой записи через `mqtt_publish_alarm()` — тот же топик `ro_plant/alarms`, тот же JSON, что и при `alarm_raise`. Вызывается из обработчика `MQTT_EVENT_CONNECTED` после `alarm_clear(ALARM_MQTT_DISCONNECT)`.
+
+**Зачем нужно:** топик `ro_plant/alarms` публикуется без `retain` (см. `mqtt_publish_alarm` в `mqtt_publish.c`). После `MQTT_EVENT_DISCONNECTED` брокер выбрасывает не-retained сообщения; новые подписчики (HMI, диспетчер) после reconnect не увидят активные аварии, пока что-нибудь не поднимется/снимется заново. До C-4 это давало устаревшее состояние.
+
+**Безопасность по lock'ам:** `alarm_get_active()` сама захватывает `s_lock` `alarm_manager`, копирует записи и отпускает lock — публикация выполняется уже без удержания lock'а, поэтому дедлоков нет даже если publish косвенно дёрнет alarm API.
+
+**Размер снапшота:** локальный массив `MQTT_REPUBLISH_MAX_ALARMS = 32` записей (совпадает с `MAX_ACTIVE` в `alarm_manager.c`), на стеке ~768 байт.
+
+---
+
 #### `mqtt_event_handler`
 
 ```c
@@ -251,7 +275,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 
 | Событие | Действия |
 |---------|----------|
-| `MQTT_EVENT_CONNECTED` | Устанавливает `s_connected = true`. Публикует availability "online" (`mqtt_publish_online`). Публикует HA Discovery (`mqtt_publish_ha_discovery`). Подписывается на командные топики (`mqtt_subscribe_all`). Снимает аварию `ALARM_MQTT_DISCONNECT`. Пробуждает `MqttTask` для немедленной публикации статуса. |
+| `MQTT_EVENT_CONNECTED` | Устанавливает `s_connected = true`. Публикует availability "online" (`mqtt_publish_online`). Публикует HA Discovery (`mqtt_publish_ha_discovery`). Подписывается на командные топики (`mqtt_subscribe_all`). Снимает аварию `ALARM_MQTT_DISCONNECT`. **Phase-4 (C-4):** перепубликовывает активные аварии (`republish_active_alarms`) — иначе после reconnect подписчики не увидят текущих active, т.к. `ro_plant/alarms` публикуется без retain. Пробуждает `MqttTask` для немедленной публикации статуса. |
 | `MQTT_EVENT_DISCONNECTED` | Устанавливает `s_connected = false`. Поднимает аварию `ALARM_MQTT_DISCONNECT` с категорией `ALARM_CAT_INFO` и значением `0`. |
 | `MQTT_EVENT_DATA` | Передаёт входящее сообщение в `mqtt_subscribe_handle_message` для диспетчеризации. |
 | `MQTT_EVENT_ERROR` | Логирует тип ошибки на уровне `ESP_LOGE`. |

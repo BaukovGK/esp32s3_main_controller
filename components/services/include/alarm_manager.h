@@ -43,11 +43,45 @@ typedef enum {
     ALARM_SENSOR_FAULT_P4   = 0x0053,
     ALARM_SENSOR_FAULT_T    = 0x0054,
     ALARM_MQTT_DISCONNECT   = 0x0060,
-    ALARM_MODBUS_OFFLINE    = 0x0070,
+    ALARM_MODBUS_OFFLINE    = 0x0070,   /* value = slave addr */
     ALARM_STATE_CHANGE      = 0x0080,
     ALARM_FAULT_RESET       = 0x0081,
     ALARM_MANUAL_DEP_WARN   = 0x0082,   /* MANUAL: нарушение зависимости агрегатов */
     ALARM_SYSTEM_START      = 0x0090,
+    /* Введены в Phase-1 (отказоустойчивость) */
+    ALARM_DO_READBACK_FAIL  = 0x00A0,   /* TCA9554: реальное состояние != ожидаемое */
+    ALARM_I2C_BUS_HUNG      = 0x00A1,   /* Таймаут I2C-семафора (>100мс) */
+    ALARM_MB_DATA_LOCK_HUNG = 0x00A2,   /* Таймаут mutex Modbus poller */
+    /* Введены в Phase-2 (надёжность) */
+    ALARM_UNEXPECTED_RESTART = 0x00B0,  /* Перезагрузка не от POWERON/SW (panic, WDT, brownout); value = esp_reset_reason_t.
+                                         * Также используется при невалидном восстановлении SM-state из NVS
+                                         * (повреждённое значение state или маски fault_flags). */
+    ALARM_RESTART_DURING_OP  = 0x00B1,  /* Перезагрузка во время AUTO/WASHING — оператор должен сбросить fault */
+    ALARM_STEP_TIMEOUT       = 0x00B2,  /* AUTO: подсостояние не завершилось за timeouts.step_timeout_s (зависание процесса);
+                                         * value = (float)auto_substate_t. */
+    /* Введены в Phase-3 (зрелость) */
+    ALARM_LOW_HEAP           = 0x00C0,  /* free heap < threshold; value = свободные байты */
+    /* Введены в Phase-5 (KWS-306L integration) */
+    ALARM_PUMP_LP_NO_CURRENT = 0x00C1,  /* НД: отсутствует ток при RUNNING; value = текущий ток (А) */
+    ALARM_PUMP_HP_NO_CURRENT = 0x00C2,  /* ВД: отсутствует ток при RUNNING; value = текущий ток (А) */
+    ALARM_PUMP_LP_OVERTEMP   = 0x00C3,  /* НД: перегрев двигателя; value = температура (°C) */
+    ALARM_PUMP_HP_OVERTEMP   = 0x00C4,  /* ВД: перегрев двигателя; value = температура (°C) */
+    ALARM_KWS_VOLTAGE_OOR    = 0x00C5,  /* KWS V вне допуска (1ф НД 200..250 В, 3ф ВД фазное 198..242 В);
+                                         * value = измеренное напряжение */
+    ALARM_KWS_OFFLINE        = 0x00C6,  /* нет связи с KWS slave 20 или 21;
+                                         * value = адрес slave (20 или 21) */
+    /* Введены в Phase-5 (mb_device_check) — health check Modbus-устройств при старте.
+     * Это диагностические алармы (категория ALARM/INFO), не CRITICAL — установка
+     * продолжает работать, оператор должен проверить настройку прибора. */
+    ALARM_DEV_CHECK_FAILED   = 0x00D0,  /* health-check провалился (value = число неудачных устройств) */
+    ALARM_AI_BAD_MODE        = 0x00D1,  /* Waveshare AI: канал не в режиме 4–20мА после автокоррекции;
+                                         * value = номер канала (1..8) */
+    ALARM_AI_WRONG_ADDR      = 0x00D2,  /* Waveshare AI: device addr != expected; value = читаемый адрес */
+    ALARM_AI_VERSION_MISMATCH = 0x00D3, /* Waveshare AI: неожиданная FW version; value = raw register (V*100+v) */
+    ALARM_AI_RANGE_OOR       = 0x00D4,  /* Waveshare AI: канал вне sanity-диапазона (зарезервировано) */
+    ALARM_SL21_RANGE_OOR     = 0x00D5,  /* СЛ21: проводимость или температура вне ожидаемого диапазона */
+    ALARM_URZH_RANGE_OOR     = 0x00D6,  /* УРЖ2КМ: NaN/inf/огромный расход на старте */
+    ALARM_KWS_RANGE_OOR      = 0x00D7,  /* KWS: voltage/temperature вне sanity-диапазона */
 } alarm_code_t;
 
 /* Запись аварии */

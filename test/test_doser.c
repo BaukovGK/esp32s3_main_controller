@@ -4,6 +4,8 @@
  *
  * Тестирует doser_update(): переходы OFF → RUNNING → PAUSE → RUNNING,
  * управление DO5, enable/disable.
+ *
+ * TODO: тесты для дозатора в WASHING — см. README.md.
  */
 #include "unity.h"
 #include "doser.h"
@@ -37,7 +39,6 @@ void test_doser_starts_on_auto_running(void)
 /* 2. Полный цикл: RUNNING(5мин) → PAUSE(55мин) → RUNNING */
 void test_doser_full_cycle(void)
 {
-    /* Запуск */
     doser_update(true);
     TEST_ASSERT_EQUAL(DOSER_RUNNING, doser_get_state());
 
@@ -79,7 +80,6 @@ void test_doser_disabled(void)
 /* 5. Изменение конфигурации влияет на длительность */
 void test_doser_config_change(void)
 {
-    /* Установить короткий цикл: run=1мин, cycle=2мин */
     plant_config_t *cfg = mock_config_get_mutable();
     cfg->doser.run_time_min = 1;
     cfg->doser.cycle_time_min = 2;

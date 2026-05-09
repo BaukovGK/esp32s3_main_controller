@@ -55,9 +55,25 @@ static const char *TAG = "config";
 #define CFG_PUMP_RAMP_LO    5000
 #define CFG_PUMP_RAMP_HI    30000
 
+/* Phase-4: таймаут шага AUTO, сек */
+#define CFG_STEP_TIMEOUT_LO 10
+#define CFG_STEP_TIMEOUT_HI 600
+
 /* MQTT */
 #define CFG_MQTT_INTV_LO    1
 #define CFG_MQTT_INTV_HI    60
+
+/* Phase-5: KWS-306L пороги защиты */
+#define CFG_KWS_IMIN_LO     0.0f
+#define CFG_KWS_IMIN_HI     5.0f
+#define CFG_KWS_IDLY_LO     1000     /* мс */
+#define CFG_KWS_IDLY_HI     30000
+#define CFG_KWS_TMAX_LO     40.0f    /* °C */
+#define CFG_KWS_TMAX_HI     120.0f
+#define CFG_KWS_VLP_LO      150.0f   /* В: 1-фазное (НД) */
+#define CFG_KWS_VLP_HI      280.0f
+#define CFG_KWS_VHP_LO      150.0f   /* В: фазное от 3-фазного (ВД) */
+#define CFG_KWS_VHP_HI      280.0f
 
 /* NVS string load buffer */
 #define NVS_STR_BUF_SIZE    128
@@ -88,6 +104,7 @@ static const plant_config_t s_defaults = {
     .timeouts = {
         .pump_confirm_ms = 3000,
         .pump_ramp_ms = 15000,
+        .step_timeout_s = 60,
     },
     .mqtt = {
         .broker_uri = "mqtt://192.168.1.1:1883",
@@ -96,6 +113,23 @@ static const plant_config_t s_defaults = {
         .client_id = "ro_plant",
         .publish_interval_s = 5,
         .enabled = 1,
+    },
+    /* Phase-4: web auth выключен по умолчанию (пустой username).
+     * Включается через POST /api/v1/config/web_auth. */
+    .web_auth = {
+        .username = "",
+        .password = "",
+    },
+    /* Phase-5: KWS-306L пороги защиты насосов. Значения подобраны под
+     * стандартное оборудование (1ф 220В ±10%, 3ф 380В/√3 ±10%). */
+    .kws = {
+        .current_min_A = 0.1f,
+        .current_check_delay_ms = 5000,
+        .temp_max_C = 80.0f,
+        .voltage_lp_min_V = 200.0f,
+        .voltage_lp_max_V = 250.0f,
+        .voltage_hp_min_V = 198.0f,
+        .voltage_hp_max_V = 242.0f,
     },
 };
 
@@ -175,6 +209,29 @@ static void validate_timeouts(config_timeouts_t *t)
 {
     t->pump_confirm_ms = clamp_i32(t->pump_confirm_ms, CFG_PUMP_CONF_LO, CFG_PUMP_CONF_HI, s_defaults.timeouts.pump_confirm_ms);
     t->pump_ramp_ms    = clamp_i32(t->pump_ramp_ms, CFG_PUMP_RAMP_LO, CFG_PUMP_RAMP_HI, s_defaults.timeouts.pump_ramp_ms);
+    t->step_timeout_s  = clamp_i32(t->step_timeout_s, CFG_STEP_TIMEOUT_LO, CFG_STEP_TIMEOUT_HI, s_defaults.timeouts.step_timeout_s);
+}
+
+static void validate_kws(config_kws_t *k)
+{
+    k->current_min_A          = clamp_float(k->current_min_A, CFG_KWS_IMIN_LO, CFG_KWS_IMIN_HI, s_defaults.kws.current_min_A);
+    k->current_check_delay_ms = clamp_i32(k->current_check_delay_ms, CFG_KWS_IDLY_LO, CFG_KWS_IDLY_HI, s_defaults.kws.current_check_delay_ms);
+    k->temp_max_C             = clamp_float(k->temp_max_C, CFG_KWS_TMAX_LO, CFG_KWS_TMAX_HI, s_defaults.kws.temp_max_C);
+    k->voltage_lp_min_V       = clamp_float(k->voltage_lp_min_V, CFG_KWS_VLP_LO, CFG_KWS_VLP_HI, s_defaults.kws.voltage_lp_min_V);
+    k->voltage_lp_max_V       = clamp_float(k->voltage_lp_max_V, CFG_KWS_VLP_LO, CFG_KWS_VLP_HI, s_defaults.kws.voltage_lp_max_V);
+    k->voltage_hp_min_V       = clamp_float(k->voltage_hp_min_V, CFG_KWS_VHP_LO, CFG_KWS_VHP_HI, s_defaults.kws.voltage_hp_min_V);
+    k->voltage_hp_max_V       = clamp_float(k->voltage_hp_max_V, CFG_KWS_VHP_LO, CFG_KWS_VHP_HI, s_defaults.kws.voltage_hp_max_V);
+    /* min < max — иначе сброс к дефолтам */
+    if (k->voltage_lp_min_V >= k->voltage_lp_max_V) {
+        k->voltage_lp_min_V = s_defaults.kws.voltage_lp_min_V;
+        k->voltage_lp_max_V = s_defaults.kws.voltage_lp_max_V;
+        ESP_LOGW(TAG, "KWS: voltage_lp_min >= max, сброс к дефолтам");
+    }
+    if (k->voltage_hp_min_V >= k->voltage_hp_max_V) {
+        k->voltage_hp_min_V = s_defaults.kws.voltage_hp_min_V;
+        k->voltage_hp_max_V = s_defaults.kws.voltage_hp_max_V;
+        ESP_LOGW(TAG, "KWS: voltage_hp_min >= max, сброс к дефолтам");
+    }
 }
 
 static void validate_mqtt(config_mqtt_t *m)
@@ -213,6 +270,7 @@ esp_err_t config_manager_init(void)
 
     load_i32("pmp_conf", &s_config.timeouts.pump_confirm_ms);
     load_i32("pmp_ramp", &s_config.timeouts.pump_ramp_ms);
+    load_i32("step_to",  &s_config.timeouts.step_timeout_s);
 
     load_str("mqtt_uri",  s_config.mqtt.broker_uri, sizeof(s_config.mqtt.broker_uri));
     load_str("mqtt_user", s_config.mqtt.username,   sizeof(s_config.mqtt.username));
@@ -221,12 +279,26 @@ esp_err_t config_manager_init(void)
     load_i32("mqtt_intv", &s_config.mqtt.publish_interval_s);
     load_i32("mqtt_en",   &s_config.mqtt.enabled);
 
+    /* Phase-4: web auth */
+    load_str("web_user", s_config.web_auth.username, sizeof(s_config.web_auth.username));
+    load_str("web_pass", s_config.web_auth.password, sizeof(s_config.web_auth.password));
+
+    /* Phase-5: KWS-306L пороги (NVS-ключи короче 15 символов — ограничение NVS) */
+    load_float("kws_imin",   &s_config.kws.current_min_A);
+    load_i32  ("kws_idly",   &s_config.kws.current_check_delay_ms);
+    load_float("kws_tmax",   &s_config.kws.temp_max_C);
+    load_float("kws_vlp_min",&s_config.kws.voltage_lp_min_V);
+    load_float("kws_vlp_max",&s_config.kws.voltage_lp_max_V);
+    load_float("kws_vhp_min",&s_config.kws.voltage_hp_min_V);
+    load_float("kws_vhp_max",&s_config.kws.voltage_hp_max_V);
+
     /* Валидация */
     validate_pressure(&s_config.pressure);
     validate_doser(&s_config.doser);
     validate_washing(&s_config.washing);
     validate_timeouts(&s_config.timeouts);
     validate_mqtt(&s_config.mqtt);
+    validate_kws(&s_config.kws);
 
     ESP_LOGI(TAG, "Конфигурация загружена: P1<%.1f P3<%.1f P4<%.1f доз=%ld/%ldмин",
              s_config.pressure.p1_max, s_config.pressure.p3_max, s_config.pressure.p4_max,
@@ -248,6 +320,41 @@ void config_manager_get_copy(plant_config_t *out)
 {
     portENTER_CRITICAL(&s_mux);
     *out = s_config;
+    portEXIT_CRITICAL(&s_mux);
+}
+
+void config_manager_get_pressure(config_pressure_t *out)
+{
+    portENTER_CRITICAL(&s_mux);
+    *out = s_config.pressure;
+    portEXIT_CRITICAL(&s_mux);
+}
+
+void config_manager_get_doser(config_doser_t *out)
+{
+    portENTER_CRITICAL(&s_mux);
+    *out = s_config.doser;
+    portEXIT_CRITICAL(&s_mux);
+}
+
+void config_manager_get_washing(config_washing_t *out)
+{
+    portENTER_CRITICAL(&s_mux);
+    *out = s_config.washing;
+    portEXIT_CRITICAL(&s_mux);
+}
+
+void config_manager_get_timeouts(config_timeouts_t *out)
+{
+    portENTER_CRITICAL(&s_mux);
+    *out = s_config.timeouts;
+    portEXIT_CRITICAL(&s_mux);
+}
+
+void config_manager_get_kws(config_kws_t *out)
+{
+    portENTER_CRITICAL(&s_mux);
+    *out = s_config.kws;
     portEXIT_CRITICAL(&s_mux);
 }
 
@@ -324,6 +431,7 @@ esp_err_t config_manager_set_timeouts(const config_timeouts_t *cfg)
     esp_err_t ret = ESP_OK;
     if (hal_nvs_set_i32("pmp_conf", validated.pump_confirm_ms) != ESP_OK) ret = ESP_FAIL;
     if (hal_nvs_set_i32("pmp_ramp", validated.pump_ramp_ms) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_i32("step_to",  validated.step_timeout_s) != ESP_OK) ret = ESP_FAIL;
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "NVS: не все параметры timeouts сохранены");
     }
@@ -348,6 +456,56 @@ esp_err_t config_manager_set_mqtt(const config_mqtt_t *cfg)
     if (hal_nvs_set_i32("mqtt_en",   validated.enabled) != ESP_OK) ret = ESP_FAIL;
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "NVS: не все параметры mqtt сохранены");
+    }
+    return ret;
+}
+
+/* Phase-5: KWS-306L thresholds */
+esp_err_t config_manager_set_kws(const config_kws_t *cfg)
+{
+    config_kws_t validated = *cfg;
+    validate_kws(&validated);
+
+    portENTER_CRITICAL(&s_mux);
+    s_config.kws = validated;
+    portEXIT_CRITICAL(&s_mux);
+
+    esp_err_t ret = ESP_OK;
+    if (hal_nvs_set_float("kws_imin",   validated.current_min_A) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_i32  ("kws_idly",   validated.current_check_delay_ms) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_float("kws_tmax",   validated.temp_max_C) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_float("kws_vlp_min",validated.voltage_lp_min_V) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_float("kws_vlp_max",validated.voltage_lp_max_V) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_float("kws_vhp_min",validated.voltage_hp_min_V) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_float("kws_vhp_max",validated.voltage_hp_max_V) != ESP_OK) ret = ESP_FAIL;
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "NVS: не все параметры kws сохранены");
+    }
+    return ret;
+}
+
+/* Phase-4 (H-13): web Basic Auth */
+esp_err_t config_manager_set_web_auth(const config_web_auth_t *cfg)
+{
+    config_web_auth_t validated = *cfg;
+    /* Trivial-валидация: терминаторы строк */
+    validated.username[sizeof(validated.username) - 1] = '\0';
+    validated.password[sizeof(validated.password) - 1] = '\0';
+
+    portENTER_CRITICAL(&s_mux);
+    s_config.web_auth = validated;
+    portEXIT_CRITICAL(&s_mux);
+
+    esp_err_t ret = ESP_OK;
+    if (hal_nvs_set_str("web_user", validated.username) != ESP_OK) ret = ESP_FAIL;
+    if (hal_nvs_set_str("web_pass", validated.password) != ESP_OK) ret = ESP_FAIL;
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "NVS: web_auth не сохранён");
+    }
+    if (validated.username[0] == '\0') {
+        ESP_LOGW(TAG, "Web auth: пустой username — авторизация ВЫКЛЮЧЕНА");
+    } else {
+        ESP_LOGI(TAG, "Web auth: включена для пользователя '%s'", validated.username);
     }
     return ret;
 }

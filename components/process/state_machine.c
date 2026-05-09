@@ -5,13 +5,16 @@
 #include "state_machine.h"
 #include "interlocks.h"
 #include "hal_gpio.h"
+#include "hal_nvs.h"
 #include "config_manager.h"
 #include "board_config.h"
 #include "analog_input.h"
+#include "power_meter.h"
 #include "alarm_manager.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include <stdatomic.h>
 #include <string.h>
 #include <math.h>
 
@@ -41,6 +44,20 @@ static int64_t s_step_start_time = 0;
 /* Метки запуска насосов для проверки подтверждения */
 static int64_t s_pump_start_us[3] = {0, 0, 0};
 
+/* C-2: флаг подтверждения промывки от оператора. Пишется из контекста
+ * httpd / MQTT (state_machine_update вызывает atomic_store при получении
+ * CMD_CONFIRM_WASH_PHASE), читается из ProcessTask в update_washing.
+ * Использован _Atomic вместо мьютекса — однобитный флаг с RMW-семантикой
+ * (atomic_exchange читает и сбрасывает за одну операцию). */
+static _Atomic bool s_wash_confirm_pending = false;
+
+/* Phase-2 (K-4): NVS-ключи для персистентности SM */
+#define NVS_KEY_SM_STATE   "sm_state"
+#define NVS_KEY_SM_FAULT   "sm_fault"
+
+/* Forward */
+static void persist_sm_state(void);
+
 /* ===== Вспомогательные функции ===== */
 
 static void all_outputs_off(void)
@@ -59,7 +76,10 @@ static void enter_fault(uint32_t flags)
     if (s_state != SM_FAULT) {
         ESP_LOGE(TAG, "АВАРИЯ! Флаги: 0x%04lX", (unsigned long)s_fault_flags);
         s_state = SM_FAULT;
+        s_step_start_time = esp_timer_get_time();
     }
+    /* Сохраняем после каждого OR-ения — оператор увидит все флаги после рестарта */
+    persist_sm_state();
 }
 
 /* ===== Общие утилиты конвертации имён (экспортируемые) ===== */
@@ -88,12 +108,22 @@ const char *sm_wash_sub_name(wash_substate_t sub)
     return (sub < sizeof(names)/sizeof(names[0])) ? names[sub] : "UNKNOWN";
 }
 
+static void persist_sm_state(void)
+{
+    /* Сохраняем state и fault_flags в NVS. Вызывается при каждом переходе.
+     * Ошибки NVS логируются, но не считаются критичными (NVS может временно
+     * быть занят). Безопасное состояние — IDLE при невозможности прочитать. */
+    (void)hal_nvs_set_i32(NVS_KEY_SM_STATE, (int32_t)s_state);
+    (void)hal_nvs_set_i32(NVS_KEY_SM_FAULT, (int32_t)s_fault_flags);
+}
+
 static void set_state(sm_state_t new_state)
 {
     if (s_state != new_state) {
         ESP_LOGI(TAG, "Состояние: %s → %s", sm_state_name(s_state), sm_state_name(new_state));
         s_state = new_state;
         s_step_start_time = esp_timer_get_time();
+        persist_sm_state();
     }
 }
 
@@ -116,8 +146,9 @@ static void set_auto_sub(auto_substate_t sub)
 static bool check_pump_confirmation(uint8_t idx, bool pump_on, uint8_t di_pin)
 {
     int64_t now = esp_timer_get_time();
-    const plant_config_t *cfg = config_manager_get();
-    int64_t confirm_us = (int64_t)cfg->timeouts.pump_confirm_ms * 1000LL;
+    config_timeouts_t tcfg;
+    config_manager_get_timeouts(&tcfg);
+    int64_t confirm_us = (int64_t)tcfg.pump_confirm_ms * 1000LL;
 
     if (!pump_on) {
         s_pump_start_us[idx] = 0;
@@ -144,12 +175,125 @@ static bool check_pump_confirmation(uint8_t idx, bool pump_on, uint8_t di_pin)
 
 /* ===== Обработчики подсостояний ===== */
 
+/**
+ * @brief Phase-5: проверки на основе данных KWS-306L (НД/ВД насосы).
+ *
+ * Поднимает interlocks и алармы в трёх категориях:
+ *  1. NO_CURRENT — насос команд "ON", но KWS Я ниже current_min_A
+ *     (срабатывает только в AUTO_RUNNING после current_check_delay_ms).
+ *  2. OVERTEMP — KWS T > temp_max_C (всегда в AUTO).
+ *  3. VOLTAGE_OOR — KWS V вне допуска (всегда в AUTO).
+ *
+ * Данные с offline / valid=false → NaN от геттера → проверка пропускается
+ * (offline-аларм поднимается отдельно в process_task).
+ *
+ * @return  true — обнаружена аномалия, SM уже в FAULT (caller должен return);
+ *          false — всё OK, продолжить обработку substate.
+ */
+static bool check_kws_interlocks(void)
+{
+    config_kws_t kcfg;
+    config_manager_get_kws(&kcfg);
+
+    /* --- 1. NO_CURRENT: только в RUNNING, после задержки от старта насоса --- */
+    if (s_auto_sub == AUTO_RUNNING) {
+        int64_t since_step = esp_timer_get_time() - s_step_start_time;
+        int64_t delay_us   = (int64_t)kcfg.current_check_delay_ms * 1000LL;
+        if (since_step >= delay_us) {
+            /* НД (PUMP_LP, pump_feed) — проверяем только если SM хочет, чтобы насос был включён */
+            if (s_want_pump_feed) {
+                float i_lp = power_meter_get_current(PUMP_LP);
+                if (!isnan(i_lp) && i_lp < kcfg.current_min_A) {
+                    ESP_LOGE(TAG, "НД-насос: ток %.3f А < %.3f А (порог) — обмотка не включилась",
+                             i_lp, kcfg.current_min_A);
+                    alarm_raise(ALARM_PUMP_LP_NO_CURRENT, ALARM_CAT_CRITICAL, i_lp);
+                    enter_fault(INTERLOCK_PUMP_LP_NO_CURRENT);
+                    return true;
+                }
+            }
+            /* ВД (PUMP_HP, pump_stage2) — аналогично */
+            if (s_want_pump_stage2) {
+                float i_hp = power_meter_get_current(PUMP_HP);
+                if (!isnan(i_hp) && i_hp < kcfg.current_min_A) {
+                    ESP_LOGE(TAG, "ВД-насос: ток %.3f А < %.3f А (порог) — обмотка не включилась",
+                             i_hp, kcfg.current_min_A);
+                    alarm_raise(ALARM_PUMP_HP_NO_CURRENT, ALARM_CAT_CRITICAL, i_hp);
+                    enter_fault(INTERLOCK_PUMP_HP_NO_CURRENT);
+                    return true;
+                }
+            }
+        }
+    }
+
+    /* --- 2. OVERTEMP: всегда (даже на холостом, нагрев инерционен) --- */
+    float t_lp = power_meter_get_temperature(PUMP_LP);
+    if (!isnan(t_lp) && t_lp > kcfg.temp_max_C) {
+        ESP_LOGE(TAG, "НД-насос: перегрев %.1f°C > %.1f°C", t_lp, kcfg.temp_max_C);
+        alarm_raise(ALARM_PUMP_LP_OVERTEMP, ALARM_CAT_CRITICAL, t_lp);
+        enter_fault(INTERLOCK_PUMP_LP_OVERTEMP);
+        return true;
+    }
+    float t_hp = power_meter_get_temperature(PUMP_HP);
+    if (!isnan(t_hp) && t_hp > kcfg.temp_max_C) {
+        ESP_LOGE(TAG, "ВД-насос: перегрев %.1f°C > %.1f°C", t_hp, kcfg.temp_max_C);
+        alarm_raise(ALARM_PUMP_HP_OVERTEMP, ALARM_CAT_CRITICAL, t_hp);
+        enter_fault(INTERLOCK_PUMP_HP_OVERTEMP);
+        return true;
+    }
+
+    /* --- 3. VOLTAGE_OOR: проверяем напряжение питания НД/ВД --- */
+    float v_lp = power_meter_get_voltage(PUMP_LP);
+    if (!isnan(v_lp) && (v_lp < kcfg.voltage_lp_min_V || v_lp > kcfg.voltage_lp_max_V)) {
+        ESP_LOGE(TAG, "НД-насос: напряжение %.1f В вне [%.1f..%.1f] В",
+                 v_lp, kcfg.voltage_lp_min_V, kcfg.voltage_lp_max_V);
+        alarm_raise(ALARM_KWS_VOLTAGE_OOR, ALARM_CAT_ALARM, v_lp);
+        enter_fault(INTERLOCK_KWS_VOLTAGE_OOR);
+        return true;
+    }
+    float v_hp = power_meter_get_voltage(PUMP_HP);
+    if (!isnan(v_hp) && (v_hp < kcfg.voltage_hp_min_V || v_hp > kcfg.voltage_hp_max_V)) {
+        ESP_LOGE(TAG, "ВД-насос: напряжение %.1f В вне [%.1f..%.1f] В",
+                 v_hp, kcfg.voltage_hp_min_V, kcfg.voltage_hp_max_V);
+        alarm_raise(ALARM_KWS_VOLTAGE_OOR, ALARM_CAT_ALARM, v_hp);
+        enter_fault(INTERLOCK_KWS_VOLTAGE_OOR);
+        return true;
+    }
+
+    return false;
+}
+
 static void update_auto(const interlock_result_t *ilk)
 {
-    const plant_config_t *cfg = config_manager_get();
+    config_timeouts_t tcfg;
+    config_manager_get_timeouts(&tcfg);
     int64_t elapsed = esp_timer_get_time() - s_step_start_time;
-    int64_t ramp_us = (int64_t)cfg->timeouts.pump_ramp_ms * 1000LL;
+    int64_t ramp_us = (int64_t)tcfg.pump_ramp_ms * 1000LL;
     uint8_t di = hal_gpio_read_di();
+
+    /* Phase-4 (H-step-timeout): защита от «зависания» в подсостояниях, переход
+     * из которых зависит от внешних событий (DI подтверждения, уровни в баках).
+     * AUTO_RAMP исключён — там собственный таймер (pump_ramp_ms);
+     * AUTO_RUNNING — рабочий режим, не транзитный; AUTO_STOPPING — мгновенный. */
+    bool step_guarded = (s_auto_sub == AUTO_STARTING_PUMP1 ||
+                         s_auto_sub == AUTO_STARTING_PUMP2 ||
+                         s_auto_sub == AUTO_FILLING_INTERM ||
+                         s_auto_sub == AUTO_STARTING_PUMP3);
+    if (step_guarded) {
+        int64_t step_limit_us = (int64_t)tcfg.step_timeout_s * 1000000LL;
+        if (elapsed >= step_limit_us) {
+            ESP_LOGE(TAG, "AUTO: таймаут шага %s (>%ld с)",
+                     sm_auto_sub_name(s_auto_sub), (long)tcfg.step_timeout_s);
+            alarm_raise(ALARM_STEP_TIMEOUT, ALARM_CAT_ALARM, (float)s_auto_sub);
+            enter_fault(INTERLOCK_STEP_TIMEOUT);
+            return;
+        }
+    }
+
+    /* Phase-5: KWS-306L защиты — проверяются на каждом цикле AUTO до dispatch'а
+     * substate. Если поднялся аларм — SM уже в FAULT, выходим. */
+    if (check_kws_interlocks()) {
+        return;
+    }
 
     switch (s_auto_sub) {
     case AUTO_STARTING_PUMP1:
@@ -228,6 +372,13 @@ static void update_auto(const interlock_result_t *ilk)
         memset(s_pump_start_us, 0, sizeof(s_pump_start_us));
         set_state(SM_IDLE);
         break;
+
+    default:
+        /* Phase-3 (L-1): защита от повреждённого enum (memory corruption / EMI).
+         * Если auto_sub содержит невалидное значение — переходим в FAULT. */
+        ESP_LOGE(TAG, "AUTO: невалидный auto_sub=%d", (int)s_auto_sub);
+        enter_fault(0);  /* fault без флагов — отдельный неклассифицированный сбой */
+        break;
     }
 }
 
@@ -254,9 +405,6 @@ static bool heater_hysteresis(float t, const config_washing_t *w)
     return true;
 }
 
-/* Pending wash confirm flag (set by CMD_CONFIRM_WASH_PHASE) */
-static bool s_wash_confirm_pending = false;
-
 static void set_wash_sub(wash_substate_t sub)
 {
     if (s_wash_sub != sub) {
@@ -268,17 +416,18 @@ static void set_wash_sub(wash_substate_t sub)
 
 static void update_washing(const interlock_result_t *ilk)
 {
-    const plant_config_t *cfg = config_manager_get();
-    const config_washing_t *w = &cfg->washing;
+    config_washing_t wcfg;
+    config_manager_get_washing(&wcfg);
+    const config_washing_t *w = &wcfg;
     float t = analog_input_get_value(AI_CH_T);
     int64_t elapsed = esp_timer_get_time() - s_step_start_time;
     int64_t heat_limit_us  = (int64_t)w->heat_timeout_min * 60LL * 1000000LL;
     int64_t supply_limit_us = (int64_t)w->supply_time_min * 60LL * 1000000LL;
     int64_t drain_limit_us  = (int64_t)w->drain_time_min  * 60LL * 1000000LL;
 
-    /* Проверка подтверждения оператора */
-    bool confirmed = s_wash_confirm_pending;
-    s_wash_confirm_pending = false;
+    /* Проверка подтверждения оператора (C-2: atomic exchange — атомарное чтение+сброс,
+     * чтобы не потерять flag, выставленный из httpd/MQTT-задачи между чтением и сбросом). */
+    bool confirmed = atomic_exchange(&s_wash_confirm_pending, false);
 
     switch (s_wash_sub) {
     case WASH_WAIT_HEAT:
@@ -360,6 +509,12 @@ static void update_washing(const interlock_result_t *ilk)
         ESP_LOGI(TAG, "Промывка завершена");
         set_state(SM_IDLE);
         break;
+
+    default:
+        /* Phase-3 (L-1): защита от повреждённого enum */
+        ESP_LOGE(TAG, "WASHING: невалидный wash_sub=%d", (int)s_wash_sub);
+        enter_fault(0);
+        break;
     }
 }
 
@@ -367,17 +522,70 @@ static void update_washing(const interlock_result_t *ilk)
 
 void state_machine_init(void)
 {
-    s_state = SM_IDLE;
     s_auto_sub = AUTO_STARTING_PUMP1;
     s_wash_sub = WASH_WAIT_HEAT;
-    s_fault_flags = 0;
     s_pending_cmd = CMD_NONE;
     s_manual_do_mask = 0;
-    s_wash_confirm_pending = false;
+    atomic_store(&s_wash_confirm_pending, false);
     all_outputs_off();
     memset(s_pump_start_us, 0, sizeof(s_pump_start_us));
     hal_gpio_write_do(0x00);
-    ESP_LOGI(TAG, "Конечный автомат инициализирован");
+
+    /* Phase-2 (K-4): восстановление состояния из NVS.
+     *
+     * Стратегия восстановления:
+     *  - last == FAULT          → войти в FAULT с сохранёнными flags
+     *                             (оператор должен явно сделать reset)
+     *  - last == AUTO/WASHING   → войти в FAULT с INTERLOCK_UNEXPECTED_RESTART
+     *                             (нельзя слепо продолжить — состояние агрегатов неизвестно)
+     *  - last == IDLE/MANUAL    → стартуем с IDLE
+     *  - неизвестное / повреждённое значение → IDLE + ALARM_UNEXPECTED_RESTART
+     *
+     * Phase-4 (C-3): валидация значений из NVS. Если NVS повреждена или туда
+     * подсунули мусор — нельзя слепо привести к enum (UB) и нельзя доверять
+     * битам fault_flags вне известной маски. Невалидное → чистый IDLE +
+     * ALARM_UNEXPECTED_RESTART. saved_flags маскируется по INTERLOCK_KNOWN_MASK,
+     * чтобы «лишние» биты не отображались оператору как реальные. */
+    int32_t saved_state = (int32_t)SM_IDLE;
+    int32_t saved_flags = 0;
+    (void)hal_nvs_get_i32(NVS_KEY_SM_STATE, &saved_state);
+    (void)hal_nvs_get_i32(NVS_KEY_SM_FAULT, &saved_flags);
+
+    bool state_valid = (saved_state >= (int32_t)SM_IDLE &&
+                        saved_state <= (int32_t)SM_FAULT);
+    uint32_t flags_raw = (uint32_t)saved_flags;
+    uint32_t flags_known = flags_raw & INTERLOCK_KNOWN_MASK;
+    bool flags_valid = (flags_raw == flags_known);  /* ни одного «лишнего» бита */
+
+    if (!state_valid || !flags_valid) {
+        ESP_LOGE(TAG, "NVS: повреждённые SM-данные (state=%ld flags=0x%08lX) — старт с IDLE",
+                 (long)saved_state, (unsigned long)flags_raw);
+        alarm_raise(ALARM_UNEXPECTED_RESTART, ALARM_CAT_ALARM, (float)saved_state);
+        s_state = SM_IDLE;
+        s_fault_flags = 0;
+    } else {
+        sm_state_t prev = (sm_state_t)saved_state;
+        if (prev == SM_FAULT) {
+            s_state = SM_FAULT;
+            s_fault_flags = flags_known;
+            ESP_LOGW(TAG, "Восстановлено из NVS: FAULT flags=0x%04lX",
+                     (unsigned long)s_fault_flags);
+        } else if (prev == SM_AUTO || prev == SM_WASHING) {
+            s_state = SM_FAULT;
+            s_fault_flags = flags_known | INTERLOCK_UNEXPECTED_RESTART;
+            ESP_LOGE(TAG, "Перезагрузка во время %s — переход в FAULT (flags=0x%04lX)",
+                     sm_state_name(prev), (unsigned long)s_fault_flags);
+            alarm_raise(ALARM_RESTART_DURING_OP, ALARM_CAT_CRITICAL, (float)prev);
+        } else {
+            s_state = SM_IDLE;
+            s_fault_flags = 0;
+        }
+    }
+    s_step_start_time = esp_timer_get_time();
+    persist_sm_state();
+
+    ESP_LOGI(TAG, "Конечный автомат инициализирован: state=%s flags=0x%04lX",
+             sm_state_name(s_state), (unsigned long)s_fault_flags);
 }
 
 void state_machine_send_command(sm_command_t cmd)
@@ -453,7 +661,7 @@ void state_machine_update(void)
         } else if (cmd == CMD_START_WASHING) {
             set_state(SM_WASHING);
             s_wash_sub = WASH_WAIT_HEAT;
-            s_wash_confirm_pending = false;
+            atomic_store(&s_wash_confirm_pending, false);
         } else if (cmd == CMD_SET_MANUAL) {
             set_state(SM_MANUAL);
             s_manual_do_mask = 0;
@@ -473,7 +681,7 @@ void state_machine_update(void)
             set_state(SM_IDLE);
         } else {
             if (cmd == CMD_CONFIRM_WASH_PHASE) {
-                s_wash_confirm_pending = true;
+                atomic_store(&s_wash_confirm_pending, true);
             }
             update_washing(&ilk);
         }
@@ -516,6 +724,16 @@ void state_machine_update(void)
             ESP_LOGI(TAG, "Авария сброшена");
         }
         return;  /* В FAULT не применяем выходы */
+
+    default:
+        /* Phase-3 (L-1): невалидное состояние SM (memory corruption / EMI).
+         * Принудительный safe-state и FAULT. */
+        ESP_LOGE(TAG, "SM: невалидное state=%d, переход в FAULT", (int)s_state);
+        all_outputs_off();
+        hal_gpio_write_do(0x00);
+        s_state = SM_FAULT;
+        persist_sm_state();
+        return;
     }
 
     /* 4. Применение выходов с учётом интерлоков */

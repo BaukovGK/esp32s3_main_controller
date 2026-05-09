@@ -1,6 +1,16 @@
 /**
  * @file hal_gpio.c
  * @brief DI (прямые GPIO с debounce) + DO (через I2C TCA9554)
+ *
+ * Phase-1 (отказоустойчивость):
+ *  - Доступ к разделяемому s_do_state защищён FreeRTOS-mutex'ом.
+ *    Ранее использовался portMUX_TYPE (spinlock), что вызывало DEADLOCK:
+ *    внутри critical section вызывался hal_i2c_write_reg(), который сам
+ *    берёт SemaphoreHandle_t — блокирующий вызов из critical section
+ *    запрещён ESP-IDF.
+ *  - hal_gpio_verify_do() читает OUTPUT TCA9554 и сравнивает с кэшем,
+ *    при расхождении поднимает ALARM_DO_READBACK_FAIL и пытается
+ *    восстановить состояние.
  */
 #include "hal_gpio.h"
 #include "hal_i2c.h"
@@ -9,15 +19,15 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/portmacro.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "hal_gpio";
 
 /* --- TCA9554 регистры --- */
-#define TCA9554_REG_INPUT   0x00
-#define TCA9554_REG_OUTPUT  0x01
+#define TCA9554_REG_INPUT    0x00
+#define TCA9554_REG_OUTPUT   0x01
 #define TCA9554_REG_POLARITY 0x02
-#define TCA9554_REG_CONFIG  0x03
+#define TCA9554_REG_CONFIG   0x03
 
 /* --- Таблица GPIO для DI --- */
 static const int s_di_gpios[BOARD_DI_COUNT] = {
@@ -31,9 +41,22 @@ static const int s_di_gpios[BOARD_DI_COUNT] = {
 static uint8_t s_debounce_cnt[BOARD_DI_COUNT];
 static uint8_t s_di_stable;  /* стабилизированное состояние DI (битовая маска) */
 
-/* --- DO кэш + спинлок для защиты read-modify-write --- */
-static uint8_t s_do_state;
-static portMUX_TYPE s_do_mux = portMUX_INITIALIZER_UNLOCKED;
+/* --- DO кэш + mutex для read-modify-write --- */
+static uint8_t           s_do_state;
+static SemaphoreHandle_t s_do_lock = NULL;
+
+#define DO_LOCK_TIMEOUT_MS  100
+
+static inline bool do_lock_take(void)
+{
+    if (s_do_lock == NULL) return true;  /* до init() */
+    return xSemaphoreTake(s_do_lock, pdMS_TO_TICKS(DO_LOCK_TIMEOUT_MS)) == pdTRUE;
+}
+
+static inline void do_lock_give(void)
+{
+    if (s_do_lock) xSemaphoreGive(s_do_lock);
+}
 
 esp_err_t hal_gpio_init(void)
 {
@@ -54,6 +77,15 @@ esp_err_t hal_gpio_init(void)
         }
     }
 
+    /* Mutex для защиты s_do_state */
+    if (s_do_lock == NULL) {
+        s_do_lock = xSemaphoreCreateMutex();
+        if (s_do_lock == NULL) {
+            ESP_LOGE(TAG, "Не удалось создать mutex для DO");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     /* Инициализация DO: TCA9554 — все пины = выход, все выключены */
     esp_err_t ret = hal_i2c_write_reg(BOARD_TCA9554_ADDR, TCA9554_REG_OUTPUT, 0x00);
     if (ret != ESP_OK) {
@@ -66,6 +98,19 @@ esp_err_t hal_gpio_init(void)
         ESP_LOGE(TAG, "TCA9554 ошибка записи регистра конфигурации");
         return ret;
     }
+
+    /* Verify init: читаем OUTPUT обратно */
+    uint8_t actual = 0xFF;
+    ret = hal_i2c_read_reg(BOARD_TCA9554_ADDR, TCA9554_REG_OUTPUT, &actual);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "TCA9554 verify-read не удалось: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    if (actual != 0x00) {
+        ESP_LOGE(TAG, "TCA9554 init verify mismatch: expected 0x00, got 0x%02X", actual);
+        return ESP_ERR_INVALID_STATE;
+    }
+
     s_do_state = 0x00;
 
     /* Начальное чтение DI */
@@ -120,22 +165,23 @@ bool hal_gpio_read_di_pin(uint8_t pin)
 
 esp_err_t hal_gpio_write_do(uint8_t mask)
 {
-    portENTER_CRITICAL(&s_do_mux);
+    if (!do_lock_take()) {
+        ESP_LOGE(TAG, "DO lock timeout (write_do) — возможно зависла шина I2C");
+        return ESP_ERR_TIMEOUT;
+    }
+
     esp_err_t ret = hal_i2c_write_reg(BOARD_TCA9554_ADDR, TCA9554_REG_OUTPUT, mask);
+    if (ret != ESP_OK) {
+        /* Повтор 1 раз */
+        ret = hal_i2c_write_reg(BOARD_TCA9554_ADDR, TCA9554_REG_OUTPUT, mask);
+    }
     if (ret == ESP_OK) {
         s_do_state = mask;
     } else {
-        /* Повтор 1 раз */
-        ret = hal_i2c_write_reg(BOARD_TCA9554_ADDR, TCA9554_REG_OUTPUT, mask);
-        if (ret == ESP_OK) {
-            s_do_state = mask;
-        }
+        ESP_LOGE(TAG, "DO запись (mask=0x%02X) ошибка: %s", mask, esp_err_to_name(ret));
     }
-    portEXIT_CRITICAL(&s_do_mux);
 
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "DO запись ошибка: %s", esp_err_to_name(ret));
-    }
+    do_lock_give();
     return ret;
 }
 
@@ -145,32 +191,32 @@ esp_err_t hal_gpio_write_do_pin(uint8_t pin, bool state)
         return ESP_ERR_INVALID_ARG;
     }
 
-    portENTER_CRITICAL(&s_do_mux);
-    uint8_t new_state = s_do_state;
-    if (state) {
-        new_state |= (1 << (pin - 1));
-    } else {
-        new_state &= ~(1 << (pin - 1));
+    if (!do_lock_take()) {
+        ESP_LOGE(TAG, "DO lock timeout (write_do_pin %d)", pin);
+        return ESP_ERR_TIMEOUT;
     }
+
+    uint8_t new_state = s_do_state;
+    if (state) new_state |= (1 << (pin - 1));
+    else       new_state &= ~(1 << (pin - 1));
+
     esp_err_t ret = hal_i2c_write_reg(BOARD_TCA9554_ADDR, TCA9554_REG_OUTPUT, new_state);
+    if (ret != ESP_OK) {
+        ret = hal_i2c_write_reg(BOARD_TCA9554_ADDR, TCA9554_REG_OUTPUT, new_state);
+    }
     if (ret == ESP_OK) {
         s_do_state = new_state;
     } else {
-        ret = hal_i2c_write_reg(BOARD_TCA9554_ADDR, TCA9554_REG_OUTPUT, new_state);
-        if (ret == ESP_OK) {
-            s_do_state = new_state;
-        }
-    }
-    portEXIT_CRITICAL(&s_do_mux);
-
-    if (ret != ESP_OK) {
         ESP_LOGE(TAG, "DO pin %d запись ошибка: %s", pin, esp_err_to_name(ret));
     }
+
+    do_lock_give();
     return ret;
 }
 
 uint8_t hal_gpio_read_do_state(void)
 {
+    /* Atomic read uint8 — lock не нужен */
     return s_do_state;
 }
 
@@ -178,4 +224,32 @@ bool hal_gpio_is_estop_raw(void)
 {
     /* DI5 = s_di_gpios[4], инверсия: LOW = активен */
     return (gpio_get_level(s_di_gpios[4]) == 0);
+}
+
+esp_err_t hal_gpio_verify_do(void)
+{
+    uint8_t actual = 0;
+    esp_err_t ret = hal_i2c_read_reg(BOARD_TCA9554_ADDR, TCA9554_REG_OUTPUT, &actual);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "verify_do: чтение TCA9554 не удалось: %s", esp_err_to_name(ret));
+        return ret;  /* caller (process_task) поднимает аларм */
+    }
+
+    /* Считываем ожидаемое состояние под lock'ом */
+    if (!do_lock_take()) {
+        ESP_LOGE(TAG, "verify_do: DO lock timeout");
+        return ESP_ERR_TIMEOUT;
+    }
+    uint8_t expected = s_do_state;
+    do_lock_give();
+
+    if (actual != expected) {
+        ESP_LOGE(TAG, "DO readback mismatch! expected=0x%02X actual=0x%02X",
+                 expected, actual);
+        /* Попытка восстановить: записать ожидаемое */
+        (void)hal_gpio_write_do(expected);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return ESP_OK;
 }

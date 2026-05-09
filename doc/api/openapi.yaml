@@ -1,0 +1,891 @@
+openapi: '3.0.3'
+info:
+  title: RO Plant Controller — Web REST API
+  version: '1.0.0'
+  description: |
+    HTTP REST API встроенного веб-сервера контроллера RO-установки
+    (ESP32-S3, ESP-IDF 5.4.4).
+
+    Все API-endpoints находятся под префиксом `/api/v1/`. Корень `/`,
+    `/style.css`, `/app.js` отдают встроенную статику HMI (см.
+    `web_static.c`).
+
+    ## Аутентификация (Phase-4, H-13)
+
+    Basic Auth включается выставлением непустого `username` в
+    `config.web_auth`. При пустом `username` авторизация **выключена**
+    (backward-compat). Если auth включена — **все** endpoints (включая
+    GET-статусы) требуют корректный `Authorization: Basic ...` заголовок.
+    Сравнение константно-временное (`mbedtls_ct_memcmp`).
+
+    Все POST-команды защищены через `web_auth_check()` всегда — даже
+    когда auth выкл., внутренняя проверка вернёт `true` и пропустит
+    запрос (см. `web_auth.c:149`).
+
+    ## Формат ошибок
+
+    Стандартный JSON: `{"ok": false, "error": "<msg>"}` со статусом
+    400 / 409 / 401. Успешный ответ POST: `{"ok": true}`.
+
+servers:
+  - url: 'http://{controller_ip}'
+    description: Локальный HTTP-сервер контроллера (порт 80)
+    variables:
+      controller_ip:
+        default: '192.168.1.50'
+
+components:
+  securitySchemes:
+    basicAuth:
+      type: http
+      scheme: basic
+      description: |
+        HTTP Basic Auth. Включается через `POST /api/v1/config/web_auth`
+        с непустым `username`. При пустом username — auth выключен,
+        endpoints доступны анонимно.
+
+  schemas:
+    OkResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+          example: true
+
+    ErrorResponse:
+      type: object
+      required: [ok, error]
+      properties:
+        ok:
+          type: boolean
+          example: false
+        error:
+          type: string
+
+    StateName:
+      type: string
+      enum: [IDLE, AUTO, WASHING, MANUAL, FAULT, UNKNOWN]
+
+    AutoSubName:
+      type: string
+      enum:
+        - STARTING_PUMP1
+        - RAMP
+        - STARTING_PUMP2
+        - FILLING_INTERM
+        - STARTING_PUMP3
+        - RUNNING
+        - STOPPING
+        - UNKNOWN
+
+    WashSubName:
+      type: string
+      enum:
+        - WAIT_HEAT
+        - HEATING
+        - WAIT_SUPPLY
+        - SUPPLY
+        - WAIT_DRAIN
+        - DRAIN
+        - DONE
+        - UNKNOWN
+
+    DoserState:
+      type: string
+      enum: [OFF, RUNNING, PAUSE, UNKNOWN]
+
+    Interlocks:
+      type: object
+      required: [flags, estop, filter_warn, allow]
+      properties:
+        flags:
+          type: integer
+          format: uint32
+        estop:
+          type: boolean
+        filter_warn:
+          type: boolean
+        allow:
+          type: array
+          minItems: 5
+          maxItems: 5
+          description: |
+            Порядок: [allow_pump_feed, allow_pump_stage1,
+            allow_pump_stage2, allow_heater, allow_doser]
+          items:
+            type: boolean
+
+    Doser:
+      type: object
+      required: [state, enabled]
+      properties:
+        state:
+          $ref: '#/components/schemas/DoserState'
+        enabled:
+          type: boolean
+
+    AnalogChannel:
+      type: object
+      required: [name, value, unit, fault]
+      properties:
+        name:
+          type: string
+          enum: [P1, P2, P3, P4, T]
+        value:
+          type: number
+          format: float
+          nullable: true
+        unit:
+          type: string
+          enum: [bar, C]
+        fault:
+          type: boolean
+
+    FlowChannel:
+      type: object
+      required: [name, flow, volume, ok]
+      properties:
+        name:
+          type: string
+          enum: [Q1, Q2, Q3, Q4]
+        flow:
+          type: number
+          format: float
+          nullable: true
+        volume:
+          type: number
+          format: float
+          nullable: true
+        ok:
+          type: boolean
+
+    CondChannel:
+      type: object
+      required: [name, value, temp, ok]
+      properties:
+        name:
+          type: string
+          description: |
+            UTF-8 имена сигма σ1/σ2/σ3 (3 канала в текущем эндпоинте
+            `/api/v1/status`; ср. с MQTT, где 4 канала). Cм. TODO ниже.
+        value:
+          type: number
+          format: float
+          nullable: true
+          description: Удельная электропроводность, мкСм/см
+        temp:
+          type: number
+          format: float
+          nullable: true
+          description: Температура, °C
+        ok:
+          type: boolean
+
+    Telemetry:
+      type: object
+      properties:
+        filter_dp:
+          type: number
+          format: float
+          nullable: true
+        stage1_feed:
+          type: number
+          format: float
+          nullable: true
+        recovery2:
+          type: number
+          format: float
+          nullable: true
+        recovery_sys:
+          type: number
+          format: float
+          nullable: true
+        sel1:
+          type: number
+          format: float
+          nullable: true
+        sel2:
+          type: number
+          format: float
+          nullable: true
+
+    StatusResponse:
+      type: object
+      required:
+        - state
+        - fault_flags
+        - di
+        - do
+        - interlocks
+        - doser
+        - analog
+        - flow
+        - cond
+        - telemetry
+        - uptime_s
+      properties:
+        state:
+          $ref: '#/components/schemas/StateName'
+        auto_sub:
+          allOf:
+            - $ref: '#/components/schemas/AutoSubName'
+          nullable: true
+          description: null если state ≠ AUTO
+        wash_sub:
+          allOf:
+            - $ref: '#/components/schemas/WashSubName'
+          nullable: true
+          description: null если state ≠ WASHING
+        fault_flags:
+          type: integer
+          format: uint32
+        di:
+          type: integer
+          minimum: 0
+          maximum: 255
+        do:
+          type: integer
+          minimum: 0
+          maximum: 255
+        interlocks:
+          $ref: '#/components/schemas/Interlocks'
+        doser:
+          $ref: '#/components/schemas/Doser'
+        analog:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnalogChannel'
+        flow:
+          type: array
+          items:
+            $ref: '#/components/schemas/FlowChannel'
+        cond:
+          type: array
+          description: |
+            TODO: на 2026-05-09 endpoint возвращает 3 элемента
+            (σ1/σ2/σ3) — массив `cond_names` в `web_api_status.c:148`
+            захардкожен на 3 имени, но цикл идёт `for i < COND_CHANNEL_COUNT`
+            (=4). Это приведёт к UB при i=3. См. также MQTT-топики
+            `ro_plant/status/conductivity/s1..s4` (4 канала).
+          items:
+            $ref: '#/components/schemas/CondChannel'
+        telemetry:
+          $ref: '#/components/schemas/Telemetry'
+        uptime_s:
+          type: integer
+
+    ConfigPressure:
+      type: object
+      required: [p1_max, p3_max, p4_max, filter_dp_warn]
+      properties:
+        p1_max: { type: number, format: float, description: 'Макс. P1, бар' }
+        p3_max: { type: number, format: float }
+        p4_max: { type: number, format: float }
+        filter_dp_warn: { type: number, format: float }
+
+    ConfigDoser:
+      type: object
+      required: [run_time_min, cycle_time_min]
+      properties:
+        run_time_min: { type: integer }
+        cycle_time_min: { type: integer }
+
+    ConfigWashing:
+      type: object
+      properties:
+        target_temp_C: { type: number, format: float }
+        max_temp_C: { type: number, format: float }
+        t_overshoot_C: { type: number, format: float }
+        hysteresis_C: { type: number, format: float }
+        heat_timeout_min: { type: integer }
+        supply_time_min: { type: integer }
+        drain_time_min: { type: integer }
+
+    ConfigTimeouts:
+      type: object
+      properties:
+        pump_confirm_ms: { type: integer }
+        pump_ramp_ms: { type: integer }
+
+    ConfigMqtt:
+      type: object
+      required: [broker_uri, username, password, client_id, publish_interval_s, enabled]
+      properties:
+        broker_uri:
+          type: string
+          example: 'mqtt://192.168.1.100:1883'
+        username:
+          type: string
+        password:
+          type: string
+          description: |
+            На GET возвращается замаскированно (`***`), если задан;
+            иначе пустая строка. На POST — полный пароль.
+        client_id:
+          type: string
+        publish_interval_s:
+          type: integer
+        enabled:
+          type: integer
+          description: 0/1 (хранится как int)
+
+    ConfigResponse:
+      type: object
+      required: [pressure, doser, washing, timeouts, mqtt]
+      properties:
+        pressure:
+          $ref: '#/components/schemas/ConfigPressure'
+        doser:
+          $ref: '#/components/schemas/ConfigDoser'
+        washing:
+          $ref: '#/components/schemas/ConfigWashing'
+        timeouts:
+          $ref: '#/components/schemas/ConfigTimeouts'
+        mqtt:
+          $ref: '#/components/schemas/ConfigMqtt'
+
+    MqttStatusResponse:
+      type: object
+      required: [connected, broker, enabled]
+      properties:
+        connected:
+          type: boolean
+        broker:
+          type: string
+        enabled:
+          type: boolean
+
+    AlarmCode:
+      type: string
+      enum:
+        - ESTOP
+        - SOURCE_EMPTY
+        - INTERM_EMPTY
+        - P1_HIGH
+        - P3_HIGH
+        - P4_HIGH
+        - T_HIGH
+        - FILTER_DP
+        - PUMP1_TIMEOUT
+        - PUMP2_TIMEOUT
+        - PUMP3_TIMEOUT
+        - SENSOR_P1
+        - SENSOR_P2
+        - SENSOR_P3
+        - SENSOR_P4
+        - SENSOR_T
+        - MQTT_DISC
+        - MODBUS_OFF
+        - STATE_CHG
+        - FAULT_RST
+        - MANUAL_DEP
+        - SYS_START
+        - DO_READBACK
+        - I2C_HUNG
+        - MB_LOCK_HUNG
+        - UNEXP_RST
+        - RST_DURING_OP
+        - STEP_TIMEOUT
+        - LOW_HEAP
+        - UNKNOWN
+
+    AlarmCategory:
+      type: string
+      enum: [CRITICAL, ALARM, WARNING, INFO, UNKNOWN]
+
+    AlarmActiveEntry:
+      type: object
+      required: [id, ts, cat, code, value]
+      properties:
+        id:
+          type: integer
+        ts:
+          type: integer
+          description: Timestamp в секундах от старта (esp_timer)
+        cat:
+          $ref: '#/components/schemas/AlarmCategory'
+        code:
+          $ref: '#/components/schemas/AlarmCode'
+        value:
+          type: number
+          format: float
+
+    AlarmHistoryEntry:
+      type: object
+      required: [id, ts, cat, code, active]
+      properties:
+        id: { type: integer }
+        ts: { type: integer }
+        cat: { $ref: '#/components/schemas/AlarmCategory' }
+        code: { $ref: '#/components/schemas/AlarmCode' }
+        active:
+          type: boolean
+          description: true = raise, false = clear
+
+    AlarmsResponse:
+      type: object
+      required: [active, history]
+      properties:
+        active:
+          type: array
+          maxItems: 16
+          items:
+            $ref: '#/components/schemas/AlarmActiveEntry'
+        history:
+          type: array
+          maxItems: 16
+          items:
+            $ref: '#/components/schemas/AlarmHistoryEntry'
+
+    ModbusDevice:
+      type: object
+      required: [addr, errors, online]
+      properties:
+        addr: { type: integer }
+        errors: { type: integer }
+        online: { type: boolean }
+
+    DiagnosticsResponse:
+      type: object
+      required: [heap_free, heap_min, uptime_s, stack, modbus]
+      properties:
+        heap_free: { type: integer }
+        heap_min: { type: integer }
+        uptime_s: { type: integer }
+        stack:
+          type: object
+          additionalProperties:
+            type: integer
+        modbus:
+          type: array
+          items:
+            $ref: '#/components/schemas/ModbusDevice'
+
+    CommandRequest:
+      type: object
+      required: [cmd]
+      properties:
+        cmd:
+          type: string
+          enum:
+            - start_auto
+            - stop
+            - start_washing
+            - confirm_wash
+            - set_manual
+            - reset_fault
+
+    ManualDoRequest:
+      type: object
+      required: [mask]
+      properties:
+        mask:
+          type: integer
+          minimum: 0
+          maximum: 255
+
+    DoserEnableRequest:
+      type: object
+      required: [enabled]
+      properties:
+        enabled:
+          type: boolean
+
+    ConfigWebAuthRequest:
+      type: object
+      properties:
+        username:
+          type: string
+          description: |
+            Пустая строка → отключает Basic Auth.
+        password:
+          type: string
+
+# Все endpoints вызывают web_auth_check() — при включённой auth требуется
+# Authorization: Basic ...; при выключенной (пустой username в config)
+# проверка пропускает запросы.
+security:
+  - basicAuth: []
+  - {}    # эквивалент «нет auth» — соответствует поведению при пустом username
+
+paths:
+  /:
+    get:
+      summary: HMI — главная HTML-страница
+      tags: [Static]
+      security: []
+      responses:
+        '200':
+          description: index.html
+          content:
+            text/html:
+              schema:
+                type: string
+                format: binary
+
+  /style.css:
+    get:
+      summary: Статический CSS
+      tags: [Static]
+      security: []
+      responses:
+        '200':
+          description: style.css
+          content:
+            text/css:
+              schema:
+                type: string
+                format: binary
+
+  /app.js:
+    get:
+      summary: Статический JS HMI
+      tags: [Static]
+      security: []
+      responses:
+        '200':
+          description: app.js
+          content:
+            text/javascript:
+              schema:
+                type: string
+                format: binary
+
+  /api/v1/status:
+    get:
+      summary: Полный снимок состояния установки
+      tags: [Status]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '401':
+          description: Требуется Basic Auth (если включён)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/config:
+    get:
+      summary: Текущая конфигурация (включая masked-пароль MQTT)
+      tags: [Config]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfigResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/mqtt/status:
+    get:
+      summary: Статус MQTT-клиента
+      tags: [Status]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MqttStatusResponse'
+        '401':
+          description: Unauthorized
+
+  /api/v1/alarms:
+    get:
+      summary: Активные аварии и история (по 16 записей)
+      tags: [Status]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlarmsResponse'
+        '401':
+          description: Unauthorized
+
+  /api/v1/diagnostics:
+    get:
+      summary: Heap, стеки задач, состояние Modbus-устройств
+      tags: [Status]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DiagnosticsResponse'
+        '401':
+          description: Unauthorized
+
+  /api/v1/command:
+    post:
+      summary: Команда state machine (start/stop/mode/reset)
+      tags: [Command]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommandRequest'
+      responses:
+        '200':
+          description: Команда принята
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '400':
+          description: Неизвестная команда / неверный JSON
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+
+  /api/v1/silence:
+    post:
+      summary: Заглушить buzzer до следующего изменения списка аварий
+      description: |
+        Альтернатива аппаратной кнопке silence (на плате нет свободных DI).
+        Тело запроса игнорируется (можно отправлять пустой POST, но
+        Content-Length должен присутствовать).
+      tags: [Command]
+      responses:
+        '200':
+          description: Buzzer заглушён
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '401':
+          description: Unauthorized
+
+  /api/v1/manual/do:
+    post:
+      summary: Прямое управление DO в режиме MANUAL
+      description: |
+        Возвращает 409 Conflict если SM не в состоянии MANUAL.
+      tags: [Command]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ManualDoRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '400':
+          description: Неверный JSON / нет поля mask
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Не в режиме MANUAL
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+
+  /api/v1/doser/enable:
+    post:
+      summary: Включить / выключить дозатор
+      tags: [Command]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DoserEnableRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '400':
+          description: Неверный JSON
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+
+  /api/v1/config/web_auth:
+    post:
+      summary: Изменить credentials Basic Auth
+      description: |
+        Пустой `username` отключает auth (backward-compat). После
+        применения вызывается `web_auth_refresh()` — кэш пересчитывается
+        thread-safe (mutex).
+      tags: [Config]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfigWebAuthRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '400':
+          description: Неверный JSON
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+
+  /api/v1/config/pressure:
+    post:
+      summary: Обновить уставки давления
+      tags: [Config]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfigPressure'
+            examples:
+              partial:
+                summary: Можно отправить только часть полей
+                value:
+                  filter_dp_warn: 0.6
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '400':
+          description: Неверный JSON
+        '401':
+          description: Unauthorized
+
+  /api/v1/config/doser:
+    post:
+      summary: Обновить параметры дозатора (run/cycle minutes)
+      tags: [Config]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfigDoser'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '401':
+          description: Unauthorized
+
+  /api/v1/config/washing:
+    post:
+      summary: Обновить параметры программы промывки
+      tags: [Config]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfigWashing'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '401':
+          description: Unauthorized
+
+  /api/v1/config/timeouts:
+    post:
+      summary: Обновить таймауты насосов
+      tags: [Config]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfigTimeouts'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '401':
+          description: Unauthorized
+
+  /api/v1/config/mqtt:
+    post:
+      summary: Обновить настройки MQTT (с авто-reconnect)
+      description: |
+        После применения, если `enabled=1`, вызывается `mqtt_app_reconnect()`
+        (stop+start под общим mutex'ом). Если `enabled=0` — `mqtt_app_stop()`.
+      tags: [Config]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfigMqtt'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '400':
+          description: Неверный JSON
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+
+tags:
+  - name: Static
+    description: Встроенная статика HMI
+  - name: Status
+    description: Снимки состояния (GET, чтение)
+  - name: Config
+    description: Чтение / изменение конфигурации
+  - name: Command
+    description: Управляющие команды (state machine, ручной режим, buzzer)

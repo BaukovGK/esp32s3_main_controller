@@ -3,6 +3,7 @@
  * @brief Инициализация HTTP-сервера и регистрация URI
  */
 #include "web_server.h"
+#include "web_auth.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 
@@ -32,6 +33,9 @@ esp_err_t web_server_start(void)
         ESP_LOGE(TAG, "Ошибка запуска HTTP-сервера: %s", esp_err_to_name(ret));
         return ret;
     }
+
+    /* Phase-4: подготовить auth-кэш ДО регистрации handler'ов */
+    web_auth_init();
 
     /* Регистрация обработчиков */
     web_static_register(s_server);

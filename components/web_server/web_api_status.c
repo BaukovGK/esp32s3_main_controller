@@ -19,6 +19,7 @@
 #include "alarm_manager.h"
 #include "mqtt_app.h"
 #include "diagnostics.h"
+#include "web_auth.h"
 
 #include <math.h>
 #include <string.h>
@@ -59,6 +60,7 @@ static esp_err_t send_json(httpd_req_t *req, cJSON *root)
 
 static esp_err_t status_get_handler(httpd_req_t *req)
 {
+    if (!web_auth_check(req)) return ESP_OK;
     cJSON *root = cJSON_CreateObject();
     if (!root) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "JSON alloc failed");
@@ -117,7 +119,10 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     for (int i = 0; i < 5; i++) {
         cJSON *ch = cJSON_CreateObject();
         cJSON_AddStringToObject(ch, "name", ai_names[i]);
-        add_float_or_null(ch, "value", ai.channels[i].value);
+        /* Phase-5 (H-modbus-initial-state): valid=false (нет первого опроса
+         * или offline / fault) → JSON-null вместо нулевого значения. */
+        add_float_or_null(ch, "value",
+                          ai.channels[i].valid ? ai.channels[i].value : NAN);
         cJSON_AddStringToObject(ch, "unit", ai_units[i]);
         cJSON_AddBoolToObject(ch, "fault", ai.channels[i].fault);
         cJSON_AddItemToArray(j_analog, ch);
@@ -132,14 +137,19 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     for (int i = 0; i < FLOW_CHANNEL_COUNT; i++) {
         cJSON *ch = cJSON_CreateObject();
         cJSON_AddStringToObject(ch, "name", flow_names[i]);
-        add_float_or_null(ch, "flow", fm.flow_m3h[i]);
-        add_float_or_null(ch, "volume", fm.volume_m3[i]);
+        /* Phase-5: channel_ok=false → null */
+        add_float_or_null(ch, "flow",   fm.channel_ok[i] ? fm.flow_m3h[i]  : NAN);
+        add_float_or_null(ch, "volume", fm.channel_ok[i] ? fm.volume_m3[i] : NAN);
         cJSON_AddBoolToObject(ch, "ok", fm.channel_ok[i]);
         cJSON_AddItemToArray(j_flow, ch);
     }
 
-    /* Кондуктометры */
-    static const char *cond_names[] = {"\xCF\x83" "1", "\xCF\x83" "2", "\xCF\x83" "3"};
+    /* Кондуктометры (4 канала с 2026-05-09 — добавлен σ4=концентрат) */
+    static const char *cond_names[] = {
+        "\xCF\x83" "1", "\xCF\x83" "2", "\xCF\x83" "3", "\xCF\x83" "4"
+    };
+    _Static_assert(sizeof(cond_names) / sizeof(cond_names[0]) == COND_CHANNEL_COUNT,
+                   "cond_names must have COND_CHANNEL_COUNT entries");
     conductivity_data_t cd;
     conductivity_get_data(&cd);
 
@@ -147,8 +157,9 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     for (int i = 0; i < COND_CHANNEL_COUNT; i++) {
         cJSON *ch = cJSON_CreateObject();
         cJSON_AddStringToObject(ch, "name", cond_names[i]);
-        add_float_or_null(ch, "value", cd.conductivity_uS[i]);
-        add_float_or_null(ch, "temp", cd.temperature_C[i]);
+        /* Phase-5: channel_ok=false → null */
+        add_float_or_null(ch, "value", cd.channel_ok[i] ? cd.conductivity_uS[i] : NAN);
+        add_float_or_null(ch, "temp",  cd.channel_ok[i] ? cd.temperature_C[i]   : NAN);
         cJSON_AddBoolToObject(ch, "ok", cd.channel_ok[i]);
         cJSON_AddItemToArray(j_cond, ch);
     }
@@ -173,6 +184,7 @@ static esp_err_t status_get_handler(httpd_req_t *req)
 
 static esp_err_t config_get_handler(httpd_req_t *req)
 {
+    if (!web_auth_check(req)) return ESP_OK;
     const plant_config_t *cfg = config_manager_get();
     cJSON *root = cJSON_CreateObject();
 
@@ -214,6 +226,7 @@ static esp_err_t config_get_handler(httpd_req_t *req)
 
 static esp_err_t mqtt_status_get_handler(httpd_req_t *req)
 {
+    if (!web_auth_check(req)) return ESP_OK;
     const config_mqtt_t *cfg = &config_manager_get()->mqtt;
     char buf[128];
     snprintf(buf, sizeof(buf), "{\"connected\":%s,\"broker\":\"%s\",\"enabled\":%s}",
@@ -228,6 +241,7 @@ static esp_err_t mqtt_status_get_handler(httpd_req_t *req)
 
 static esp_err_t alarms_get_handler(httpd_req_t *req)
 {
+    if (!web_auth_check(req)) return ESP_OK;
     cJSON *root = cJSON_CreateObject();
 
     /* Активные аварии */
@@ -265,6 +279,7 @@ static esp_err_t alarms_get_handler(httpd_req_t *req)
 
 static esp_err_t diagnostics_get_handler(httpd_req_t *req)
 {
+    if (!web_auth_check(req)) return ESP_OK;
     diagnostics_data_t diag;
     diagnostics_collect(&diag);
 
@@ -280,13 +295,14 @@ static esp_err_t diagnostics_get_handler(httpd_req_t *req)
         cJSON_AddNumberToObject(j_stack, diag.tasks[i].name, diag.tasks[i].stack_free);
     }
 
-    /* Modbus */
-    cJSON *j_mb = cJSON_AddObjectToObject(root, "modbus");
-    cJSON *j_err = cJSON_AddArrayToObject(j_mb, "errors");
-    cJSON *j_onl = cJSON_AddArrayToObject(j_mb, "online");
-    for (int i = 0; i < 4; i++) {
-        cJSON_AddItemToArray(j_err, cJSON_CreateNumber(diag.mb_errors[i]));
-        cJSON_AddItemToArray(j_onl, cJSON_CreateBool(diag.mb_online[i]));
+    /* Modbus. Phase-4 (M-6): динамический список устройств. */
+    cJSON *j_mb = cJSON_AddArrayToObject(root, "modbus");
+    for (size_t i = 0; i < diag.mb_count; i++) {
+        cJSON *e = cJSON_CreateObject();
+        cJSON_AddNumberToObject(e, "addr",   diag.mb_addrs[i]);
+        cJSON_AddNumberToObject(e, "errors", diag.mb_errors[i]);
+        cJSON_AddBoolToObject  (e, "online", diag.mb_online[i]);
+        cJSON_AddItemToArray(j_mb, e);
     }
 
     return send_json(req, root);

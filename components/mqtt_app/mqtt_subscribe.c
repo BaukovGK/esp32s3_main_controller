@@ -10,6 +10,7 @@
 #include "doser.h"
 #include "config_manager.h"
 #include "board_config.h"
+#include "hal_buzzer.h"
 
 #include <string.h>
 
@@ -31,6 +32,15 @@ static void handle_mode(const char *payload, int len)
         ESP_LOGI(TAG, "MQTT команда режима: %.*s", len, payload);
         state_machine_send_command(cmd);
     }
+}
+
+/* Phase-4: глушение buzzer'а до следующего изменения списка аварий.
+ * Используется вместо аппаратной кнопки silence (на плате нет свободных DI).
+ * При следующем raise/clear аларма паттерн пересчитается в process_task. */
+static void handle_silence(void)
+{
+    ESP_LOGI(TAG, "MQTT silence buzzer");
+    hal_buzzer_silence();
 }
 
 static void handle_pump(const char *data, int len)
@@ -182,8 +192,9 @@ void mqtt_subscribe_all(esp_mqtt_client_handle_t client)
     esp_mqtt_client_subscribe(client, "ro_plant/command/pump", 1);
     esp_mqtt_client_subscribe(client, "ro_plant/command/doser", 1);
     esp_mqtt_client_subscribe(client, "ro_plant/command/heater", 1);
+    esp_mqtt_client_subscribe(client, "ro_plant/command/silence", 1);  /* Phase-4 */
     esp_mqtt_client_subscribe(client, "ro_plant/settings/#", 1);
-    ESP_LOGI(TAG, "Подписан на 5 топиков команд");
+    ESP_LOGI(TAG, "Подписан на 6 топиков команд");
 }
 
 void mqtt_subscribe_handle_message(const char *topic, int topic_len,
@@ -204,6 +215,10 @@ void mqtt_subscribe_handle_message(const char *topic, int topic_len,
     /* ro_plant/command/heater (23 символа) */
     else if (topic_len == 23 && strncmp(topic, "ro_plant/command/heater", 23) == 0) {
         handle_heater(data, data_len);
+    }
+    /* ro_plant/command/silence (24 символа) — Phase-4: глушение buzzer'а */
+    else if (topic_len == 24 && strncmp(topic, "ro_plant/command/silence", 24) == 0) {
+        handle_silence();
     }
     /* ro_plant/settings/<section> (18+ символов) */
     else if (topic_len > 18 && strncmp(topic, "ro_plant/settings/", 18) == 0) {

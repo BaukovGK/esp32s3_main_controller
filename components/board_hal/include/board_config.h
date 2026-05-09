@@ -37,6 +37,8 @@
 #define MB_ADDR_URZH2KM        2
 #define MB_ADDR_SL21_201       10
 #define MB_ADDR_SL21_101       11
+#define MB_ADDR_KWS_PUMP_LP    20   /* KWS-306L: счётчик электроэнергии НД-насоса */
+#define MB_ADDR_KWS_PUMP_HP    21   /* KWS-306L: счётчик электроэнергии ВД-насоса */
 
 /* --- Назначение дискретных выходов (RO1-RO8) --- */
 #define BOARD_DO_PUMP_FEED    1   /* RO1: насос подачи */

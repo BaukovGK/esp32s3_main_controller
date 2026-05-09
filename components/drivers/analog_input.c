@@ -6,6 +6,8 @@
 #include "modbus_poller.h"
 #include "board_config.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 #include <string.h>
 #include <math.h>
 
@@ -26,18 +28,38 @@ static uint16_t s_ma_buf[AI_CHANNEL_COUNT][MA_WINDOW];
 static uint8_t  s_ma_idx;
 static bool     s_ma_filled;
 
-/* Порог обрыва: ~0.5% от 65535 → ток ниже ~4.08мА (обрыв провода) */
-#define FAULT_RAW_THRESHOLD  328
+/* Параметры 4-20мА токовой петли — Waveshare Modbus RTU Analog Input 8CH (A).
+ *
+ * В режиме 3 (4–20 мА) raw из input-регистра возвращается в МИКРОАМПЕРАХ
+ * напрямую (4 мА = 4000, 20 мА = 20000). Это подтверждено wiki производителя
+ * (раздел Software Test → Modbus Poll: «displays the current by default,
+ * and the unit is uA») и Arduino-демо doc/waveshare_ai_ref/.
+ *
+ * ⚠️ Этот код предполагает что модуль настроен в mode=3. По умолчанию
+ * jumper'ы замкнуты и mode=3, но если кто-то перевёл модуль в mode 4
+ * (scale code 0..4095) или mode 0/1 (вольтаж), формула даст неверный
+ * результат. См. analog_input_setup() в этом файле — TODO добавить
+ * one-time-setup через FC 0x10 на регистры 4x1000..4x1007. */
+#define UA_AT_4MA               4000    /* 4.0 мА = 4000 мкА */
+#define UA_AT_20MA              20000   /* 20.0 мА */
+#define UA_SPAN                 16000   /* (20 − 4) мА = 16000 мкА */
 
-/* Параметры 4-20мА токовой петли */
-#define ADC_RAW_MAX             65535.0f
-#define CURRENT_LOOP_MIN_MA     4.0f
-#define CURRENT_LOOP_SPAN_MA    16.0f   /* 20 - 4 мА */
+/* Sensor-fault детекция:
+ *   raw < FAULT_BREAK_UA (3.5 мА)  → обрыв токовой петли (нет 4 мА «живого нуля»)
+ *   raw > FAULT_SHORT_UA (20.5 мА) → короткое замыкание / переходный процесс
+ * Зона 3.5..4.0 мА и 20.0..20.5 мА — нормальный gracefulный диапазон датчика
+ * (производственный допуск ±0.1 мА × 5 = 0.5 мА), не считаем fault. */
+#define FAULT_BREAK_UA          3500
+#define FAULT_SHORT_UA          20500
 
 /* Количество активных каналов (P1..T) */
 #define AI_ENABLED_CHANNELS     5
 
 static ai_data_t s_data;
+/* Phase-4 (M-4): защита s_data от гонок между process_task (writer) и
+ * mqtt_task / httpd (readers). Spinlock — короткие критические секции
+ * (memcpy / чтение поля), не блокирует. */
+static portMUX_TYPE s_data_mux = portMUX_INITIALIZER_UNLOCKED;
 
 void analog_input_init(void)
 {
@@ -62,10 +84,15 @@ void analog_input_init(void)
 void analog_input_update(void)
 {
     uint16_t raw[CID_AI_REG_COUNT];
-    modbus_poller_get_ai_raw(raw, CID_AI_REG_COUNT);
-    s_data.device_online = modbus_poller_is_device_online(MB_ADDR_WAVESHARE_AI);
+    /* Phase-5 (C-9/C-10/H-modbus-initial-state): raw-getter зануляет
+     * буфер и возвращает ESP_ERR_INVALID_STATE до первого опроса.
+     * Не-OK эквивалентен offline. */
+    esp_err_t err_ai = modbus_poller_get_ai_raw(raw, CID_AI_REG_COUNT);
+    bool online = modbus_poller_is_device_online(MB_ADDR_WAVESHARE_AI) &&
+                  err_ai == ESP_OK;
 
-    /* Записать в кольцевой буфер */
+    /* MA-буфер — приватен для process_task (только update пишет/читает),
+     * lock не нужен. */
     for (int ch = 0; ch < AI_CHANNEL_COUNT; ch++) {
         s_ma_buf[ch][s_ma_idx] = raw[ch];
     }
@@ -74,46 +101,83 @@ void analog_input_update(void)
 
     int count = s_ma_filled ? MA_WINDOW : (s_ma_idx > 0 ? s_ma_idx : 1);
 
+    /* Считаем новый снимок локально, потом атомарно публикуем в s_data
+     * под spinlock'ом — readers (mqtt/httpd) увидят либо старое целое,
+     * либо новое целое, но не разорванный снимок. */
+    ai_data_t snapshot;
+    snapshot.device_online = online;
+
     for (int ch = 0; ch < AI_CHANNEL_COUNT; ch++) {
         if (!s_config[ch].enabled) {
-            s_data.channels[ch].valid = false;
+            snapshot.channels[ch].valid = false;
+            snapshot.channels[ch].fault = false;
+            snapshot.channels[ch].value = 0.0f;
+            snapshot.channels[ch].raw_ma = 0.0f;
             continue;
         }
 
-        /* Среднее арифметическое */
+        /* Среднее арифметическое (raw в мкА) */
         uint32_t sum = 0;
         for (int j = 0; j < count; j++) {
             sum += s_ma_buf[ch][j];
         }
-        uint16_t avg = (uint16_t)(sum / count);
+        uint32_t avg_uA = sum / count;
 
-        /* Обрыв датчика */
-        s_data.channels[ch].fault = (avg < FAULT_RAW_THRESHOLD);
+        /* Sensor fault: обрыв линии или КЗ */
+        bool fault_break = (avg_uA < FAULT_BREAK_UA);
+        bool fault_short = (avg_uA > FAULT_SHORT_UA);
+        snapshot.channels[ch].fault = fault_break || fault_short;
 
-        /* raw 0..ADC_RAW_MAX → range_min..range_max */
-        float ratio = (float)avg / ADC_RAW_MAX;
-        s_data.channels[ch].value = s_config[ch].range_min +
-                                    ratio * (s_config[ch].range_max - s_config[ch].range_min);
-        s_data.channels[ch].raw_ma = CURRENT_LOOP_MIN_MA + ratio * CURRENT_LOOP_SPAN_MA;
-        s_data.channels[ch].valid = s_data.device_online && !s_data.channels[ch].fault;
+        /* raw_mA для диагностики — всегда, даже при fault */
+        snapshot.channels[ch].raw_ma = (float)avg_uA / 1000.0f;
+
+        if (snapshot.channels[ch].fault) {
+            /* При fault не публикуем «реальное» давление — только NaN.
+             * Caller (state_machine, mqtt) должен трактовать это как
+             * sensor fault и не принимать решений по value. */
+            snapshot.channels[ch].value = NAN;
+            snapshot.channels[ch].valid = false;
+        } else {
+            /* (raw_uA − 4000) / 16000 → ratio в 0..1 для нормальной токовой петли.
+             * Клипуем на ±допуск (3.5..20.5 мА → ratio чуть меньше 0 или больше 1
+             * не считаем fault, но прижимаем к границам диапазона датчика). */
+            float ratio = ((float)avg_uA - (float)UA_AT_4MA) / (float)UA_SPAN;
+            if (ratio < 0.0f) ratio = 0.0f;
+            if (ratio > 1.0f) ratio = 1.0f;
+
+            float span = s_config[ch].range_max - s_config[ch].range_min;
+            snapshot.channels[ch].value = s_config[ch].range_min + ratio * span;
+            snapshot.channels[ch].valid = online;
+        }
     }
+
+    portENTER_CRITICAL(&s_data_mux);
+    s_data = snapshot;
+    portEXIT_CRITICAL(&s_data_mux);
 }
 
 void analog_input_get_data(ai_data_t *out)
 {
+    portENTER_CRITICAL(&s_data_mux);
     *out = s_data;
+    portEXIT_CRITICAL(&s_data_mux);
 }
 
 float analog_input_get_value(uint8_t ch)
 {
-    if (ch >= AI_CHANNEL_COUNT || !s_data.channels[ch].valid) {
-        return NAN;
-    }
-    return s_data.channels[ch].value;
+    if (ch >= AI_CHANNEL_COUNT) return NAN;
+    portENTER_CRITICAL(&s_data_mux);
+    bool valid = s_data.channels[ch].valid;
+    float val  = s_data.channels[ch].value;
+    portEXIT_CRITICAL(&s_data_mux);
+    return valid ? val : NAN;
 }
 
 bool analog_input_is_fault(uint8_t ch)
 {
     if (ch >= AI_CHANNEL_COUNT) return true;
-    return s_data.channels[ch].fault;
+    portENTER_CRITICAL(&s_data_mux);
+    bool fault = s_data.channels[ch].fault;
+    portEXIT_CRITICAL(&s_data_mux);
+    return fault;
 }
